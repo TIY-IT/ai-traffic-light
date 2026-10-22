@@ -1311,6 +1311,7 @@ fn get_status() -> StatusSnapshot {
 #[derive(serde::Serialize)]
 struct PromptPage {
     prompts: Vec<String>,
+    items: Vec<codex_local::UserPrompt>,
     note: String,
 }
 
@@ -1318,19 +1319,56 @@ fn session_user_prompts_sync(client: String, id: String) -> Result<PromptPage, S
     if client != "codex" {
         return Ok(PromptPage {
             prompts: Vec::new(),
+            items: Vec::new(),
             note: "该客户端暂不能读取提问原文，列表里仍可看到标题和状态。".to_string(),
         });
     }
-    let prompts = codex_local::user_prompts(&id)?;
-    let note = if prompts.is_empty() {
+    let items = codex_local::user_prompt_entries(&id)?;
+    let note = if items.is_empty() {
         "这条会话里没有找到你的提问。"
     } else {
-        "只显示你的提问，不含 AI 回复。"
+        "只显示你的提问，最新的在前。"
     };
+    let prompts = items.iter().map(|item| item.text.clone()).collect();
     Ok(PromptPage {
         prompts,
+        items,
         note: note.to_string(),
     })
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if url.len() > 2048
+        || !(url.starts_with("https://") || url.starts_with("http://"))
+        || url.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err("只打开 http 或 https 链接".to_string());
+    }
+    spawn_open(url)
+        .map(|_| ())
+        .map_err(|err| format!("无法打开链接：{err}"))
+}
+
+#[cfg(windows)]
+fn spawn_open(url: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+#[cfg(not(windows))]
+fn spawn_open(url: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
 }
 
 #[tauri::command]
@@ -1537,6 +1575,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             session_user_prompts,
+            open_external_url,
             resize_light_to_fit,
             set_lamp_presence,
             window_ready,

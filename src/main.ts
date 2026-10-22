@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
 import { setupPanelControls } from "./panel-controls";
+import { formatPromptTime, promptPieces, type PromptItem } from "./prompt-display";
 
 setupPanelControls();
 
@@ -33,12 +34,23 @@ interface SessionSnapshot {
 
 interface PromptPage {
   prompts: string[];
+  items?: PromptItem[];
   note: string;
 }
 
+interface PromptView {
+  id: string;
+  note: string;
+  prompts: PromptItem[];
+  error: string;
+  showAll: boolean;
+  open: Set<number>;
+}
+
+const PREVIEW_PROMPTS = 5;
 const knownClients = ["codex", "workbuddy", "marvis", "zcode", "coze", "trae", "doubao"];
 let selectedSessionId: string | null = null;
-let promptView: { id: string; note: string; prompts: string[]; error: string } | null = null;
+let promptView: PromptView | null = null;
 
 const housings = Array.from(document.querySelectorAll<HTMLElement>(".housing"));
 const statusLabel = document.querySelector<HTMLElement>("#status-label");
@@ -279,7 +291,7 @@ function render(snapshot: StatusSnapshot) {
 
             const badge = document.createElement("span");
             badge.className = "session-state-badge";
-            badge.textContent = stateBadgeText[session.state];
+            badge.textContent = session.label || stateBadgeText[session.state];
 
             const remove = document.createElement("button");
             remove.className = "session-remove";
@@ -311,20 +323,7 @@ function render(snapshot: StatusSnapshot) {
             });
 
             if (selectedSessionId === session.id && promptView?.id === session.id) {
-              const prompts = document.createElement("ul");
-              prompts.className = "prompt-list";
-              const note = document.createElement("li");
-              note.className = promptView.error ? "prompt-error" : "prompt-note";
-              note.textContent = promptView.error || promptView.note;
-              prompts.append(note);
-              for (const text of promptView.prompts) {
-                const line = document.createElement("li");
-                line.className = "prompt-item";
-                line.textContent = text;
-                line.title = text;
-                prompts.append(line);
-              }
-              item.append(prompts);
+              item.append(renderPromptList(promptView));
             }
             return item;
           });
@@ -372,6 +371,75 @@ function fitWindowToWidget() {
   }
 }
 
+function renderPromptList(view: PromptView): HTMLElement {
+  const list = document.createElement("div");
+  list.className = "prompt-list";
+  const noteText = view.error || view.note;
+  if (noteText) {
+    const note = document.createElement("p");
+    note.className = view.error ? "prompt-error" : "prompt-note";
+    note.textContent = noteText;
+    list.append(note);
+  }
+  const newestFirst = view.prompts.map((item, index) => ({ item, index })).reverse();
+  const visible = view.showAll ? newestFirst : newestFirst.slice(0, PREVIEW_PROMPTS);
+  for (const { item, index } of visible) {
+    const card = document.createElement("article");
+    card.className = "prompt-card";
+    if (view.open.has(index)) card.classList.add("is-open");
+    const time = formatPromptTime(item.at);
+    if (time) {
+      const stamp = document.createElement("div");
+      stamp.className = "prompt-time";
+      stamp.textContent = time;
+      card.append(stamp);
+    }
+    const body = document.createElement("div");
+    body.className = "prompt-body";
+    for (const piece of promptPieces(item.text)) {
+      if (piece.kind === "link" && piece.url) {
+        const link = document.createElement("a");
+        link.className = "prompt-link";
+        link.href = piece.url;
+        link.title = piece.title || piece.url;
+        link.textContent = piece.text;
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void invoke("open_external_url", { url: piece.url });
+        });
+        body.append(link);
+      } else {
+        body.append(document.createTextNode(piece.text));
+      }
+    }
+    card.append(body);
+    card.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if ((event.target as HTMLElement | null)?.closest("a")) return;
+      if (!promptView || promptView.id !== view.id) return;
+      if (promptView.open.has(index)) promptView.open.delete(index);
+      else promptView.open.add(index);
+      void refresh();
+    });
+    list.append(card);
+  }
+  if (view.prompts.length > PREVIEW_PROMPTS) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "prompt-more";
+    more.textContent = view.showAll ? "收起" : "展开全部";
+    more.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (!promptView || promptView.id !== view.id) return;
+      promptView.showAll = !promptView.showAll;
+      void refresh();
+    });
+    list.append(more);
+  }
+  return list;
+}
+
 async function selectSession(session: SessionSnapshot) {
   if (selectedSessionId === session.id) {
     selectedSessionId = null;
@@ -385,6 +453,8 @@ async function selectSession(session: SessionSnapshot) {
     note: "正在读取你的提问…",
     prompts: [],
     error: "",
+    showAll: false,
+    open: new Set(),
   };
   await refresh();
   try {
@@ -393,7 +463,18 @@ async function selectSession(session: SessionSnapshot) {
       id: session.id,
     });
     if (selectedSessionId !== session.id) return;
-    promptView = { id: session.id, note: page.note, prompts: page.prompts, error: "" };
+    const items =
+      page.items && page.items.length > 0
+        ? page.items
+        : page.prompts.map((text) => ({ text, at: 0 }));
+    promptView = {
+      id: session.id,
+      note: page.note,
+      prompts: items,
+      error: "",
+      showAll: false,
+      open: new Set(),
+    };
   } catch (error) {
     if (selectedSessionId !== session.id) return;
     promptView = {
@@ -401,6 +482,8 @@ async function selectSession(session: SessionSnapshot) {
       note: "",
       prompts: [],
       error: `读取失败：${String(error)}`,
+      showAll: false,
+      open: new Set(),
     };
   }
   await refresh();

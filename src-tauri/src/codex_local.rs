@@ -331,6 +331,142 @@ fn find_injected_span(text: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn markdown_heading_body(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('#')?.trim_start_matches('#');
+    let body = rest.trim();
+    if body.is_empty() { None } else { Some(body) }
+}
+
+fn is_ide_context_heading(line: &str) -> bool {
+    markdown_heading_body(line)
+        .is_some_and(|body| body.to_ascii_lowercase().starts_with("context from my ide"))
+}
+
+/// `## My request:` / `## My request for Codex:` and the text that follows the colon.
+fn take_my_request(line: &str) -> Option<&str> {
+    let body = markdown_heading_body(line)?;
+    let lower = body.to_ascii_lowercase();
+    let marker_len = if lower.starts_with("my request for codex") {
+        "my request for codex".len()
+    } else if lower.starts_with("my request") {
+        "my request".len()
+    } else {
+        return None;
+    };
+    let after = &lower[marker_len..];
+    if !(after.is_empty()
+        || after.starts_with(':')
+        || after.starts_with('：')
+        || after.starts_with(' ')
+        || after.starts_with('\t'))
+    {
+        return None;
+    }
+    let rest = body.get(marker_len..)?.trim_start();
+    Some(rest.trim_start_matches([':', '：']).trim_start())
+}
+
+/// Drop a leading `# Context from my IDE setup` section and a `## My request:`
+/// heading. Text after the request heading stays; a context section after it is
+/// discarded through the end of the message.
+fn strip_markdown_wrappers(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let request_at = lines.iter().position(|line| take_my_request(line).is_some());
+    let mut kept: Vec<&str> = Vec::new();
+    let start = if let Some(at) = request_at {
+        if let Some(rest) = take_my_request(lines[at]) {
+            if !rest.is_empty() {
+                kept.push(rest);
+            }
+        }
+        at + 1
+    } else {
+        0
+    };
+    for line in lines.iter().skip(start) {
+        if is_ide_context_heading(line) {
+            break;
+        }
+        kept.push(*line);
+    }
+    if request_at.is_none()
+        && kept
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| is_ide_context_heading(line))
+    {
+        return String::new();
+    }
+    kept.join("\n")
+}
+
+fn identical_markdown_link(text: &str, start: usize) -> Option<(&str, usize)> {
+    if !text[start..].starts_with('[') {
+        return None;
+    }
+    let after = start + 1;
+    let label_end = text[after..].find("](")? + after;
+    let label = text[after..label_end].trim();
+    let url_start = label_end + 2;
+    let url_end = text[url_start..].find(')')? + url_start;
+    let url = text[url_start..url_end].trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if label != url && label.trim_end_matches('/') != url.trim_end_matches('/') {
+        return None;
+    }
+    Some((url, url_end + 1))
+}
+
+/// `[https://host/path](https://host/path)` becomes the URL once.
+fn dedupe_markdown_links(text: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < text.len() {
+        if text.as_bytes()[index] == b'[' {
+            if let Some((url, next)) = identical_markdown_link(text, index) {
+                out.push_str(url);
+                index = next;
+                continue;
+            }
+        }
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn collapse_repeated_urls_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut previous_url = String::new();
+    let mut first = true;
+    for token in line.split_whitespace() {
+        let bare = token.trim_matches(|ch: char| {
+            matches!(ch, ',' | '.' | ';' | ':' | ')' | '(' | ']' | '[' | '。' | '，' | '；')
+        });
+        let is_url = bare.starts_with("https://") || bare.starts_with("http://");
+        if is_url && bare == previous_url {
+            continue;
+        }
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.push_str(token);
+        if is_url {
+            previous_url = bare.to_string();
+        } else {
+            previous_url.clear();
+        }
+    }
+    out
+}
+
 fn clean_user_text(raw: &str) -> Option<String> {
     let mut text = raw.to_string();
     for _ in 0..64 {
@@ -342,17 +478,25 @@ fn clean_user_text(raw: &str) -> Option<String> {
         }
         text.replace_range(start..end, "\n");
     }
+    text = strip_markdown_wrappers(&text);
+    text = dedupe_markdown_links(&text);
     let kept = text
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !is_image_placeholder(line))
+        .filter_map(|line| {
+            let collapsed = collapse_repeated_urls_line(line);
+            let trimmed = collapsed.trim();
+            if trimmed.is_empty() || is_image_placeholder(trimmed) {
+                None
+            } else {
+                Some(collapse_ws(trimmed))
+            }
+        })
         .collect::<Vec<_>>()
-        .join(" ");
-    let collapsed = collapse_ws(&kept);
-    if collapsed.is_empty() || starts_injected(&collapsed) {
+        .join("\n");
+    if kept.is_empty() || starts_injected(&kept) {
         None
     } else {
-        Some(collapsed)
+        Some(kept)
     }
 }
 
@@ -379,7 +523,120 @@ fn extract_user_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn prompt_from_line(line: &str) -> Option<String> {
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UserPrompt {
+    pub text: String,
+    /// Unix seconds. `0` when the rollout line has no timestamp.
+    pub at: i64,
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
+    Some(era as i64 * 146097 + doe as i64 - 719468)
+}
+
+fn unix_from_rfc3339(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let year: i32 = text.get(0..4)?.parse().ok()?;
+    let month: u32 = text.get(5..7)?.parse().ok()?;
+    let day: u32 = text.get(8..10)?.parse().ok()?;
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    if bytes.get(10) != Some(&b'T') && bytes.get(10) != Some(&b' ') {
+        return None;
+    }
+    let hour: u32 = text.get(11..13)?.parse().ok()?;
+    let minute: u32 = text.get(14..16)?.parse().ok()?;
+    let second: u32 = text.get(17..19)?.parse().ok()?;
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut rest = text.get(19..).unwrap_or("");
+    if let Some(stripped) = rest.strip_prefix('.') {
+        let digits = stripped
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(stripped.len());
+        rest = stripped.get(digits..).unwrap_or("");
+    }
+    let offset = if rest.is_empty() || rest.starts_with('Z') || rest.starts_with('z') {
+        0
+    } else if rest.starts_with('+') || rest.starts_with('-') {
+        let sign = if rest.starts_with('-') { -1 } else { 1 };
+        let hour_off: i64 = rest.get(1..3)?.parse().ok()?;
+        let minute_off: i64 = if rest.len() >= 6 && rest.as_bytes().get(3) == Some(&b':') {
+            rest.get(4..6)?.parse().ok()?
+        } else if rest.len() >= 5 {
+            rest.get(3..5)?.parse().ok()?
+        } else {
+            0
+        };
+        sign * (hour_off * 3600 + minute_off * 60)
+    } else {
+        return None;
+    };
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64 - offset)
+}
+
+fn normalize_unix(raw: i64) -> i64 {
+    if raw.abs() > 10_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    }
+}
+
+fn unix_from_value(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => {
+            let raw = number
+                .as_i64()
+                .or_else(|| number.as_f64().map(|value| value as i64))?;
+            Some(normalize_unix(raw))
+        }
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if let Ok(raw) = text.parse::<i64>() {
+                return Some(normalize_unix(raw));
+            }
+            unix_from_rfc3339(text)
+        }
+        _ => None,
+    }
+}
+
+fn event_unix(value: &serde_json::Value) -> i64 {
+    for key in ["timestamp", "ts"] {
+        if let Some(found) = value.get(key).and_then(unix_from_value) {
+            return found;
+        }
+        if let Some(found) = value
+            .get("payload")
+            .and_then(|payload| payload.get(key))
+            .and_then(unix_from_value)
+        {
+            return found;
+        }
+    }
+    0
+}
+
+fn prompt_hit_from_line(line: &str) -> Option<UserPrompt> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -395,29 +652,43 @@ fn prompt_from_line(line: &str) -> Option<String> {
     // Both user_message and response_item are candidates. File order decides
     // which one is shown; injected blocks are removed inside clean_user_text.
     classify_user_event(&value)?;
-    clean_user_text(&extract_user_text(&value)?)
+    Some(UserPrompt {
+        text: clean_user_text(&extract_user_text(&value)?)?,
+        at: event_unix(&value),
+    })
 }
 
-fn push_prompt(bucket: &mut Vec<String>, text: String) {
+fn prompt_from_line(line: &str) -> Option<String> {
+    prompt_hit_from_line(line).map(|hit| hit.text)
+}
+
+fn push_hit(bucket: &mut Vec<UserPrompt>, hit: UserPrompt) {
     // Collapse only the copy Codex writes twice in a row. The same words typed
     // again after another prompt stay, in their original place.
-    if bucket.last() == Some(&text) {
+    if bucket.last().map(|item| item.text.as_str()) == Some(hit.text.as_str()) {
         return;
     }
-    bucket.push(text);
+    bucket.push(hit);
     if bucket.len() > MAX_PROMPTS {
         bucket.remove(0);
     }
 }
 
-fn prompts_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+fn prompt_hits_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<UserPrompt> {
     let mut kept = Vec::new();
     for line in lines {
-        if let Some(text) = prompt_from_line(line) {
-            push_prompt(&mut kept, text);
+        if let Some(hit) = prompt_hit_from_line(line) {
+            push_hit(&mut kept, hit);
         }
     }
     kept
+}
+
+fn prompts_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    prompt_hits_from_lines(lines)
+        .into_iter()
+        .map(|hit| hit.text)
+        .collect()
 }
 
 /// `Ok(None)` means the rollout was read and has no real typed prompt, so the
@@ -459,6 +730,11 @@ fn title_from_sources(sqlite_title: &str, rollout_text: &str) -> Option<String> 
 #[cfg(test)]
 fn parse_user_prompts(text: &str) -> Vec<String> {
     prompts_from_lines(text.lines())
+}
+
+#[cfg(test)]
+fn parse_user_prompt_hits(text: &str) -> Vec<UserPrompt> {
+    prompt_hits_from_lines(text.lines())
 }
 
 fn path_under(root: &Path, file: &Path) -> bool {
@@ -539,20 +815,20 @@ fn resolve_rollout(root: &Path, thread_id: &str) -> Result<Option<PathBuf>, Stri
     Ok(None)
 }
 
-fn read_prompts_file(path: &Path) -> Result<Vec<String>, String> {
+fn read_prompts_file(path: &Path) -> Result<Vec<UserPrompt>, String> {
     let file = File::open(path).map_err(|err| format!("读取会话日志失败：{err}"))?;
     let reader = BufReader::new(file);
     let mut kept = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("读取会话日志失败：{err}"))?;
-        if let Some(text) = prompt_from_line(&line) {
-            push_prompt(&mut kept, text);
+        if let Some(hit) = prompt_hit_from_line(&line) {
+            push_hit(&mut kept, hit);
         }
     }
     Ok(kept)
 }
 
-fn user_prompts_in(root: &Path, session_id: &str) -> Result<Vec<String>, String> {
+fn entries_in(root: &Path, session_id: &str) -> Result<Vec<UserPrompt>, String> {
     let thread_id = session_id.strip_prefix("codex:").unwrap_or(session_id);
     if !valid_thread_id(thread_id) {
         return Err("无效的会话 ID".to_string());
@@ -563,9 +839,17 @@ fn user_prompts_in(root: &Path, session_id: &str) -> Result<Vec<String>, String>
     read_prompts_file(&path)
 }
 
-pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
+#[cfg(test)]
+fn user_prompts_in(root: &Path, session_id: &str) -> Result<Vec<String>, String> {
+    Ok(entries_in(root, session_id)?
+        .into_iter()
+        .map(|item| item.text)
+        .collect())
+}
+
+pub fn user_prompt_entries(session_id: &str) -> Result<Vec<UserPrompt>, String> {
     let home = dirs::home_dir().ok_or("无法定位用户目录")?;
-    user_prompts_in(&home.join(".codex"), session_id)
+    entries_in(&home.join(".codex"), session_id)
 }
 
 #[cfg(test)]mod tests{
@@ -735,6 +1019,46 @@ pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
    title_from_sources("线程标题", mixed),
    Some("帮我改海外独立站，并比较 a < b".to_string())
   );
+ }
+ #[test]
+ fn user_prompts_strip_ide_request_prefixes() {
+  let text = r###"
+{"type":"event_msg","payload":{"type":"user_message","message":"# Context from my IDE setup:\n## Active file: src/main.ts\n文件内容不该出现"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"## My request:\n帮我改海外独立站的首页"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"# Context from my IDE setup:\n\n## Active file: src/main.ts\n\n## My request for Codex:\n前面的上下文丢掉"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"## My request:\n请保留这句 [https://example.com/a/very/long/path](https://example.com/a/very/long/path)\n# Context from my IDE setup:\n## Active file: src/main.ts\n不要显示这段 IDE 上下文\n[https://example.com/secret](https://example.com/secret)"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"## My request: 同一行的请求"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"## My request: 第一行\n第二行"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"## My requested changes stay"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"普通提问，不要删掉"}}
+"###;
+  assert_eq!(
+   parse_user_prompts(text),
+   vec![
+    "帮我改海外独立站的首页".to_string(),
+    "前面的上下文丢掉".to_string(),
+    "请保留这句 https://example.com/a/very/long/path".to_string(),
+    "同一行的请求".to_string(),
+    "第一行\n第二行".to_string(),
+    "## My requested changes stay".to_string(),
+    "普通提问，不要删掉".to_string()
+   ]
+  );
+  assert_eq!(
+   title_from_sources("线程标题", text),
+   Some("帮我改海外独立站的首页".to_string())
+  );
+  let timed = r###"
+{"timestamp":"2026-10-22T07:31:00Z","type":"event_msg","payload":{"type":"user_message","message":"## My request:\n带时间的提问"}}
+{"timestamp":"2026-10-22T15:31:00+08:00","type":"event_msg","payload":{"type":"user_message","message":"另一时区同一时刻"}}
+{"timestamp":1792654260000,"type":"event_msg","payload":{"type":"user_message","message":"毫秒时间戳"}}
+"###;
+  let hits = parse_user_prompt_hits(timed);
+  assert_eq!(
+   hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
+   vec!["带时间的提问", "另一时区同一时刻", "毫秒时间戳"]
+  );
+  assert!(hits.iter().all(|hit| hit.at == 1_792_654_260));
  }
  #[test]
  fn user_prompts_keep_the_full_question() {

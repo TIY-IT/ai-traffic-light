@@ -288,6 +288,11 @@ body[data-state="idle"] .light-green {
   outline: 1px solid rgba(147, 197, 253, 0.45);
 }
 
+.session-item.is-selected .session-row {
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
 .session-row {
   display: flex;
   align-items: flex-start;
@@ -306,29 +311,81 @@ body[data-state="idle"] .light-green {
 .prompt-list {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 8px;
   margin: 0;
-  padding: 0 8px 6px 16px;
-  list-style: none;
+  padding: 8px 8px 10px;
 }
 
 .prompt-note,
 .prompt-error {
+  margin: 0;
   color: rgba(255, 255, 255, 0.48);
-  font-size: 9px;
-  line-height: 1.35;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .prompt-error {
   color: #f87171;
 }
 
-.prompt-item {
-  color: rgba(255, 255, 255, 0.9);
+.prompt-card {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  cursor: pointer;
+}
+
+.prompt-card.is-open {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.prompt-time {
+  margin-bottom: 4px;
+  color: rgba(255, 255, 255, 0.55);
   font-size: 11px;
-  line-height: 1.45;
-  white-space: normal;
+  line-height: 1.3;
+}
+
+.prompt-body {
+  display: -webkit-box;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.prompt-card.is-open .prompt-body {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.prompt-link {
+  color: #93c5fd;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prompt-more {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  border-radius: 999px;
+  color: #dbeafe;
+  background: rgba(147, 197, 253, 0.12);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.prompt-more:hover {
+  background: rgba(147, 197, 253, 0.22);
 }
 
 .session-item:hover {
@@ -359,20 +416,27 @@ body[data-state="idle"] .light-green {
 
 .session-state-badge {
   flex-shrink: 0;
-  max-width: 52px;
-  margin-top: 2px;
+  margin-top: 1px;
   margin-left: auto;
-  overflow: hidden;
-  background: none;
-  color: #8fa0b3;
-  font-size: 8px;
-  line-height: 1.3;
-  text-overflow: ellipsis;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #d5dde6;
+  font-size: 12px;
+  line-height: 1.4;
   white-space: nowrap;
 }
 
 .session-working .session-state-badge {
-  color: #4ade80;
+  color: #bbf7d0;
+  background: rgba(34, 197, 94, 0.18);
+}
+
+.session-completed .session-state-badge,
+.session-waiting .session-state-badge,
+.session-error .session-state-badge {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.16);
 }
 
 .session-heading {
@@ -382,16 +446,13 @@ body[data-state="idle"] .light-green {
 }
 
 .session-heading strong {
-  display: -webkit-box;
+  display: block;
   min-width: 0;
-  overflow: hidden;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
-  line-height: 1.4;
-  white-space: normal;
+  line-height: 1.45;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
 }
 
 .session-remove {
