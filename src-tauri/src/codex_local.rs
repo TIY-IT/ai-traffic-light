@@ -66,6 +66,7 @@ fn read(home:&Path)->Result<Vec<SessionSnapshot>,Box<dyn std::error::Error>>{
   let life=read_lifecycle(Path::new(&path)).unwrap_or(Lifecycle{state:"idle",turn:String::new(),started:String::new()});
   let started:Option<i64>=db.query_row("SELECT unixepoch(?1)",[&life.started],|r|r.get(0))?;
   let state=if life.state=="working"&&now.saturating_sub(updated)>1800{"idle"}else{life.state};
+  let title=session_title(&title,Path::new(&path));
   rows.push(Row{id,title,parent,state,updated,started:started.map(|v|v.max(0) as u64).unwrap_or(0)});
  }
  Ok(aggregate(&rows,now))
@@ -154,7 +155,10 @@ fn texts_from(value: &serde_json::Value) -> Vec<String> {
     }
 }
 
-fn is_user_event(value: &serde_json::Value) -> bool {
+/// `Some(true)` is an event_msg `user_message` (or a plain `user` event): text the
+/// user typed. `Some(false)` is a `response_item` role=user, which Codex also uses
+/// for AGENTS.md, environment, and permission injections.
+fn classify_user_event(value: &serde_json::Value) -> Option<bool> {
     let kind = value.get("type").and_then(|kind| kind.as_str()).unwrap_or("");
     let payload = value.get("payload");
     let payload_kind = payload
@@ -168,7 +172,7 @@ fn is_user_event(value: &serde_json::Value) -> bool {
     if matches!(kind, "agent_message" | "assistant")
         || matches!(role, "assistant" | "system" | "developer")
     {
-        return false;
+        return None;
     }
     if matches!(
         payload_kind,
@@ -180,16 +184,174 @@ fn is_user_event(value: &serde_json::Value) -> bool {
             | "turn_aborted"
             | "token_count"
     ) {
-        return false;
+        return None;
     }
     if payload_kind == "user_message"
         || payload_kind == "user"
         || kind == "user_message"
         || kind == "user"
     {
-        return true;
+        return Some(true);
     }
-    kind == "response_item" && role == "user" && (payload_kind == "message" || payload_kind.is_empty())
+    if kind == "response_item" && role == "user" && (payload_kind == "message" || payload_kind.is_empty())
+    {
+        return Some(false);
+    }
+    None
+}
+
+fn is_injected_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "environment_context"
+            | "user_instructions"
+            | "INSTRUCTIONS"
+            | "turn_aborted"
+            | "skill"
+            | "skills"
+            | "attachment"
+            | "attachments"
+            | "image"
+            | "images"
+            | "agent_skill"
+            | "agent_skills"
+            | "skill_instructions"
+            | "user_info"
+            | "additional_data"
+    ) || tag.starts_with("permissions")
+}
+
+fn starts_injected(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("<environment_context ")
+        || text.starts_with("<user_instructions>")
+        || text.starts_with("<user_instructions ")
+        || text.starts_with("<INSTRUCTIONS>")
+        || text.starts_with("<INSTRUCTIONS ")
+        || text.starts_with("<permissions")
+        || text.starts_with("<turn_aborted>")
+        || text.starts_with("<turn_aborted ")
+        || text.starts_with("<turn_aborted/>")
+        || text.starts_with("<skill")
+        || text.starts_with("<attachment")
+        || text.starts_with("<image")
+}
+
+fn is_image_placeholder(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower == "[image]"
+        || lower.starts_with("[image ")
+        || lower.starts_with("[image]")
+        || lower == "<image>"
+        || lower == "(image)"
+        || lower.contains("image omitted")
+        || lower.starts_with("![")
+}
+
+/// Byte length of an injected open tag at the start of `text`, its name, and
+/// whether it is self-closing. `None` when the `<` is not one of those tags.
+fn parse_injected_open(text: &str) -> Option<(usize, String, bool)> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut index = 1;
+    if matches!(bytes.get(index), Some(b'/' | b'!' | b'?')) {
+        return None;
+    }
+    let name_start = index;
+    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    if index == name_start {
+        return None;
+    }
+    let name = text[name_start..index].to_string();
+    if !is_injected_tag(&name) {
+        return None;
+    }
+    while index < bytes.len() && bytes[index] != b'>' {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return None;
+    }
+    let self_closing = index > 0 && bytes[index - 1] == b'/';
+    Some((index + 1, name, self_closing))
+}
+
+fn find_injected_span(text: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let tail = &text[search_from..];
+        let tag_at = tail.find('<');
+        let agents_at = tail.find("# AGENTS.md instructions");
+        let rel = match (tag_at, agents_at) {
+            (Some(tag), Some(agents)) => tag.min(agents),
+            (Some(tag), None) => tag,
+            (None, Some(agents)) => agents,
+            (None, None) => return None,
+        };
+        let at = search_from + rel;
+        if text[at..].starts_with("# AGENTS.md instructions") {
+            let line_end = text[at..]
+                .find('\n')
+                .map(|newline| at + newline + 1)
+                .unwrap_or(text.len());
+            // A same-line `<INSTRUCTIONS>` block must stay so the text after it survives.
+            let end = text[at..line_end]
+                .find('<')
+                .map(|bracket| at + bracket)
+                .unwrap_or(line_end);
+            if end > at {
+                return Some((at, end));
+            }
+        }
+        if let Some((open_len, name, self_closing)) = parse_injected_open(&text[at..]) {
+            if self_closing {
+                return Some((at, at + open_len));
+            }
+            let close = format!("</{name}>");
+            let after = at + open_len;
+            if let Some(rel_close) = text[after..].find(&close) {
+                return Some((at, after + rel_close + close.len()));
+            }
+            return Some((at, text.len()));
+        }
+        search_from = at + 1;
+    }
+    None
+}
+
+fn clean_user_text(raw: &str) -> Option<String> {
+    let mut text = raw.to_string();
+    for _ in 0..64 {
+        let Some((start, end)) = find_injected_span(&text) else {
+            break;
+        };
+        if start >= end || end > text.len() {
+            break;
+        }
+        text.replace_range(start..end, "\n");
+    }
+    let kept = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_image_placeholder(line))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let collapsed = collapse_ws(&kept);
+    if collapsed.is_empty() || starts_injected(&collapsed) {
+        None
+    } else {
+        Some(collapsed)
+    }
+}
+
+fn fallback_title(title: &str) -> String {
+    clean_user_text(title).unwrap_or_else(|| "Codex 会话".to_string())
 }
 
 fn extract_user_text(value: &serde_json::Value) -> Option<String> {
@@ -211,7 +373,12 @@ fn extract_user_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn prompt_from_line(line: &str) -> Option<String> {
+struct PromptHit {
+    preferred: bool,
+    text: String,
+}
+
+fn prompt_from_line(line: &str) -> Option<PromptHit> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -224,31 +391,94 @@ fn prompt_from_line(line: &str) -> Option<String> {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if !is_user_event(&value) {
-        return None;
+    let preferred = classify_user_event(&value)?;
+    let text = clean_user_text(&extract_user_text(&value)?)?;
+    Some(PromptHit { preferred, text })
+}
+
+fn push_prompt(bucket: &mut Vec<String>, text: String) {
+    if bucket.last() == Some(&text) {
+        return;
     }
-    let collapsed = collapse_ws(&extract_user_text(&value)?);
-    if collapsed.is_empty() {
-        return None;
+    bucket.push(text);
+    if bucket.len() > MAX_PROMPTS {
+        bucket.remove(0);
     }
-    Some(collapsed)
+}
+
+fn merge_prompts(preferred: Vec<String>, fallback: Vec<String>) -> Vec<String> {
+    if preferred.is_empty() {
+        return fallback;
+    }
+    let mut out = preferred;
+    for text in fallback {
+        if out.len() >= MAX_PROMPTS {
+            break;
+        }
+        if out.iter().any(|item| item == &text) {
+            continue;
+        }
+        out.push(text);
+    }
+    out
+}
+
+fn prompts_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for line in lines {
+        if let Some(hit) = prompt_from_line(line) {
+            push_prompt(
+                if hit.preferred {
+                    &mut preferred
+                } else {
+                    &mut fallback
+                },
+                hit.text,
+            );
+        }
+    }
+    merge_prompts(preferred, fallback)
+}
+
+fn session_title(sqlite_title: &str, rollout: &Path) -> String {
+    first_real_prompt_in_file(rollout).unwrap_or_else(|| fallback_title(sqlite_title))
+}
+
+fn first_real_prompt_in_file(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut fallback = None;
+    let mut scanned = 0usize;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        scanned = scanned.saturating_add(line.len());
+        if let Some(hit) = prompt_from_line(&line) {
+            if hit.preferred {
+                return Some(hit.text);
+            }
+            if fallback.is_none() {
+                fallback = Some(hit.text);
+            }
+        }
+        if scanned > 8 * 1024 * 1024 {
+            break;
+        }
+    }
+    fallback
+}
+
+#[cfg(test)]
+fn title_from_sources(sqlite_title: &str, rollout_text: &str) -> String {
+    prompts_from_lines(rollout_text.lines())
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| fallback_title(sqlite_title))
 }
 
 #[cfg(test)]
 fn parse_user_prompts(text: &str) -> Vec<String> {
-    let mut kept = Vec::new();
-    for line in text.lines() {
-        if let Some(prompt) = prompt_from_line(line) {
-            if kept.last() == Some(&prompt) {
-                continue;
-            }
-            kept.push(prompt);
-            if kept.len() > MAX_PROMPTS {
-                kept.remove(0);
-            }
-        }
-    }
-    kept
+    prompts_from_lines(text.lines())
 }
 
 fn path_under(root: &Path, file: &Path) -> bool {
@@ -332,20 +562,22 @@ fn resolve_rollout(root: &Path, thread_id: &str) -> Result<Option<PathBuf>, Stri
 fn read_prompts_file(path: &Path) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|err| format!("读取会话日志失败：{err}"))?;
     let reader = BufReader::new(file);
-    let mut kept = Vec::new();
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("读取会话日志失败：{err}"))?;
-        if let Some(prompt) = prompt_from_line(&line) {
-            if kept.last() == Some(&prompt) {
-                continue;
-            }
-            kept.push(prompt);
-            if kept.len() > MAX_PROMPTS {
-                kept.remove(0);
-            }
+        if let Some(hit) = prompt_from_line(&line) {
+            push_prompt(
+                if hit.preferred {
+                    &mut preferred
+                } else {
+                    &mut fallback
+                },
+                hit.text,
+            );
         }
     }
-    Ok(kept)
+    Ok(merge_prompts(preferred, fallback))
 }
 
 fn user_prompts_in(root: &Path, session_id: &str) -> Result<Vec<String>, String> {
@@ -439,6 +671,62 @@ pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
   assert_eq!(
    parse_user_prompts(text),
    vec!["帮我看会话列表".to_string(), "第二条提问".to_string(), "第三条提问".to_string(), "同样的话".to_string()]
+  );
+ }
+ #[test]
+ fn user_prompts_drop_injected_rollout_blocks() {
+  let text = r##"
+{"type":"event_msg","payload":{"type":"user_message","message":"现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for D:\\3Dauto\\nantao-backup\n<INSTRUCTIONS>\n# 工作区约定 (D:\\3Dauto) 本文件对本工作区下所有会话生效。\n</INSTRUCTIONS>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>D:\\3Dauto\\nantao-backup</cwd>\n</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\n不要把这段系统说明显示出来\n</user_instructions>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<permissions instructions>\nallow\n</permissions>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<turn_aborted>\n用户中断了这一轮\n</turn_aborted>"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill name=\"geo\">\nwrapper\n</skill>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<attachment name=\"shot.png\">\n[Image]\n</attachment>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"这是 AI 回复"}]}}
+"##;
+  assert_eq!(
+   parse_user_prompts(text),
+   vec!["现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了".to_string()]
+  );
+ }
+ #[test]
+ fn response_item_strips_injected_blocks_and_keeps_typed_text() {
+  let text = r##"
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for D:\\3Dauto\\nantao-backup\n<INSTRUCTIONS>\n# 工作区约定\n</INSTRUCTIONS>\n现在可以把这个文件夹目录改为海外独立站\n<environment_context>\n<cwd>D:\\3Dauto</cwd>\n</environment_context>\n<permissions>\nallow all\n</permissions>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nhidden\n</user_instructions>\n<turn_aborted></turn_aborted>\n[Image]\n请只保留这句真正的提问"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill>\n不要显示技能包装\n</skill>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for D:\\foo <INSTRUCTIONS>rules</INSTRUCTIONS> 同一行里的真实提问"}]}}
+"##;
+  assert_eq!(
+   parse_user_prompts(text),
+   vec![
+    "现在可以把这个文件夹目录改为海外独立站".to_string(),
+    "请只保留这句真正的提问".to_string(),
+    "同一行里的真实提问".to_string()
+   ]
+  );
+ }
+ #[test]
+ fn session_title_uses_the_cleaned_first_user_message() {
+  let rollout = r##"
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for D:\\3Dauto\\nantao-backup\n<INSTRUCTIONS>\n工作区约定\n</INSTRUCTIONS>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context>\n<cwd>D:\\3Dauto</cwd>\n</environment_context>\n现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"第二条才是后续提问"}}
+"##;
+  let sqlite = "# AGENTS.md instructions for D:\\3Dauto\\nantao-backup <INSTRUCTIONS> 工作区约定";
+  assert_eq!(
+   title_from_sources(sqlite, rollout),
+   "现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了"
+  );
+  assert_eq!(
+   title_from_sources(sqlite, ""),
+   "Codex 会话"
+  );
+  assert_eq!(
+   title_from_sources("sqlite 里的短标题", ""),
+   "sqlite 里的短标题"
   );
  }
  #[test]
