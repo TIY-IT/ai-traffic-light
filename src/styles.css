@@ -227,6 +227,27 @@ body[data-state="idle"] .light-green {
   white-space: nowrap;
 }
 
+.session-search {
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  color: #f5f7fa;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.session-search::placeholder {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.session-search:focus {
+  outline: 2px solid rgba(147, 197, 253, 0.7);
+  outline-offset: 1px;
+}
+
 .session-list {
   display: flex;
   min-height: 0;
@@ -298,7 +319,49 @@ body[data-state="idle"] .light-green {
   align-items: flex-start;
   gap: 5px;
   min-width: 0;
-  padding: 4px 6px;
+  padding: 6px 6px 4px;
+  cursor: pointer;
+}
+
+.session-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 0 8px 8px 18px;
+}
+
+.session-summary {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.session-summary.is-pending {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.copy-prompts {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.copy-prompts:hover {
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .session-empty {

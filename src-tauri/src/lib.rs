@@ -9,6 +9,7 @@ mod notify;
 mod presence;
 mod reporter;
 mod sessions;
+mod summary;
 mod trae;
 mod workbuddy_local;
 mod zcode;
@@ -1372,6 +1373,13 @@ fn spawn_open(url: &str) -> std::io::Result<std::process::Child> {
 }
 
 #[tauri::command]
+async fn session_summary(client: String, id: String) -> Result<summary::SummaryPayload, String> {
+    tauri::async_runtime::spawn_blocking(move || summary::session_summary_sync(&client, &id))
+        .await
+        .map_err(|err| format!("摘要失败：{err}"))
+}
+
+#[tauri::command]
 async fn session_user_prompts(client: String, id: String) -> Result<PromptPage, String> {
     tauri::async_runtime::spawn_blocking(move || session_user_prompts_sync(client, id))
         .await
@@ -1575,6 +1583,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             session_user_prompts,
+            session_summary,
             open_external_url,
             resize_light_to_fit,
             set_lamp_presence,

@@ -852,6 +852,123 @@ pub fn user_prompt_entries(session_id: &str) -> Result<Vec<UserPrompt>, String> 
     entries_in(&home.join(".codex"), session_id)
 }
 
+fn assistant_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = value.get("type").and_then(|kind| kind.as_str()).unwrap_or("");
+    let payload = value.get("payload").unwrap_or(&value);
+    let payload_kind = payload.get("type").and_then(|kind| kind.as_str()).unwrap_or("");
+    let role = payload.get("role").and_then(|role| role.as_str()).unwrap_or("");
+    if matches!(payload_kind, "agent_reasoning" | "reasoning") || kind == "agent_reasoning" {
+        return None;
+    }
+    let is_assistant = matches!(kind, "agent_message" | "assistant" | "assistant_message")
+        || matches!(payload_kind, "agent_message" | "assistant_message")
+        || (role == "assistant"
+            && (kind == "response_item" || payload_kind == "message" || payload_kind.is_empty()));
+    if !is_assistant {
+        return None;
+    }
+    let text = assistant_plain(payload);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn assistant_plain(payload: &serde_json::Value) -> String {
+    for key in ["message", "text", "content"] {
+        if let Some(field) = payload.get(key) {
+            let mut parts = Vec::new();
+            collect_assistant_strings(field, &mut parts);
+            let joined = parts.join(" ");
+            if !joined.trim().is_empty() {
+                return joined;
+            }
+        }
+    }
+    String::new()
+}
+
+fn collect_assistant_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if !text.trim().is_empty() {
+                out.push(text.trim().to_string());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_assistant_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(|kind| kind.as_str()).unwrap_or("");
+            if matches!(
+                kind,
+                "reasoning" | "tool_use" | "tool_result" | "input_image" | "image"
+            ) {
+                return;
+            }
+            if let Some(text) = map.get("text").and_then(|text| text.as_str()) {
+                if !text.trim().is_empty() {
+                    out.push(text.trim().to_string());
+                }
+                return;
+            }
+            if let Some(message) = map.get("message") {
+                collect_assistant_strings(message, out);
+            } else if let Some(content) = map.get("content") {
+                collect_assistant_strings(content, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(count - max_chars).collect()
+}
+
+/// Filtered user prompts in file order, plus the tail of the last assistant message.
+pub fn conversation_excerpt(session_id: &str) -> Result<(Vec<UserPrompt>, String), String> {
+    let home = dirs::home_dir().ok_or("无法定位用户目录")?;
+    excerpt_in(&home.join(".codex"), session_id)
+}
+
+fn excerpt_in(root: &Path, session_id: &str) -> Result<(Vec<UserPrompt>, String), String> {
+    let thread_id = session_id.strip_prefix("codex:").unwrap_or(session_id);
+    if !valid_thread_id(thread_id) {
+        return Err("无效的会话 ID".to_string());
+    }
+    let Some(path) = resolve_rollout(root, thread_id)? else {
+        return Ok((Vec::new(), String::new()));
+    };
+    let file = File::open(&path).map_err(|err| format!("读取会话日志失败：{err}"))?;
+    let reader = BufReader::new(file);
+    let mut kept = Vec::new();
+    let mut assistant = String::new();
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("读取会话日志失败：{err}"))?;
+        if let Some(hit) = prompt_hit_from_line(&line) {
+            push_hit(&mut kept, hit);
+        }
+        if let Some(text) = assistant_from_line(&line) {
+            assistant = tail_chars(&text, 4000);
+        }
+    }
+    Ok((kept, assistant))
+}
+
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn only_matching_task_end_finishes(){

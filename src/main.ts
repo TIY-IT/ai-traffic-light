@@ -38,6 +38,11 @@ interface PromptPage {
   note: string;
 }
 
+interface SummaryPayload {
+  state: string;
+  text: string;
+}
+
 interface PromptView {
   id: string;
   note: string;
@@ -51,6 +56,14 @@ const PREVIEW_PROMPTS = 5;
 const knownClients = ["codex", "workbuddy", "marvis", "zcode", "coze", "trae", "doubao"];
 let selectedSessionId: string | null = null;
 let promptView: PromptView | null = null;
+let latestSnapshot: StatusSnapshot | null = null;
+let searchQuery = "";
+const summaryById = new Map<string, { state: string; text: string; updatedAt: number }>();
+const summaryFlight = new Set<string>();
+const promptCache = new Map<string, PromptItem[]>();
+const promptFlight = new Set<string>();
+const copiedUntil = new Map<string, number>();
+const sessionSearch = document.querySelector<HTMLInputElement>("#session-search");
 
 const housings = Array.from(document.querySelectorAll<HTMLElement>(".housing"));
 const statusLabel = document.querySelector<HTMLElement>("#status-label");
@@ -187,6 +200,7 @@ function publishHitRegions() {
 }
 
 function render(snapshot: StatusSnapshot) {
+  latestSnapshot = snapshot;
   snapshot.session_count = snapshot.sessions.length;
 
   // 灯只在使用中出现:运行中绿灯,15 分钟内刚停红灯。更早的已停和暂无状态不渲染。
@@ -262,29 +276,41 @@ function render(snapshot: StatusSnapshot) {
           .filter((client) => !knownClients.includes(client)),
       ),
     );
-    const clients = [...knownClients, ...extras];
+    const clients = [...knownClients, ...extras].sort((left, right) => {
+      const running = (client: string) =>
+        snapshot.sessions.some(
+          (session) => session.client === client && session.state === "working",
+        );
+      return Number(running(right)) - Number(running(left));
+    });
     const scrollTop = sessionList.scrollTop;
-    sessionList.replaceChildren(
-      ...clients.flatMap((client) => {
+    const query = searchQuery.trim().toLowerCase();
+    const rows = clients.flatMap((client) => {
         const groupTitle = document.createElement("li");
         groupTitle.className = "session-group-title";
         groupTitle.textContent = clientLabel(client);
 
         const sessions = snapshot.sessions
           .filter((session) => session.client === client)
-          // 组内排序:运行中的排最前,其余按 updated_at 倒序(最新在前)。
+          // 运行中的钉在组内最前，其余按更新时间倒序。
           .sort(
             (left, right) =>
               Number(right.state === "working") - Number(left.state === "working") ||
               right.updated_at - left.updated_at,
           )
+          .filter((session) => sessionVisible(session, query))
           .map((session) => {
+            ensureSummary(session);
             const item = document.createElement("li");
             item.className = `session-item session-${session.state}`;
-            if (selectedSessionId === session.id) item.classList.add("is-selected");
+            const open = selectedSessionId === session.id;
+            if (open) item.classList.add("is-selected");
 
             const row = document.createElement("div");
             row.className = "session-row";
+            row.tabIndex = 0;
+            row.setAttribute("role", "button");
+            row.setAttribute("aria-expanded", String(open));
 
             const dot = document.createElement("span");
             dot.className = "session-dot";
@@ -315,14 +341,39 @@ function render(snapshot: StatusSnapshot) {
             heading.append(title);
 
             row.append(dot, heading, badge, remove);
-            item.append(row);
-            item.title = session.title || "查看你的提问";
-            item.addEventListener("click", (event) => {
-              if ((event.target as HTMLElement | null)?.closest(".prompt-list")) return;
+            row.addEventListener("click", (event) => {
+              if ((event.target as HTMLElement | null)?.closest("button")) return;
               void selectSession(session);
             });
+            row.addEventListener("keydown", (event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              void selectSession(session);
+            });
+            item.append(row);
 
-            if (selectedSessionId === session.id && promptView?.id === session.id) {
+            const summary = summaryLine(session);
+            const foot = document.createElement("div");
+            foot.className = "session-foot";
+            if (summary) {
+              const line = document.createElement("p");
+              line.className = summary.pending ? "session-summary is-pending" : "session-summary";
+              line.textContent = summary.text;
+              foot.append(line);
+            }
+            const copy = document.createElement("button");
+            copy.type = "button";
+            copy.className = "copy-prompts";
+            const copied = (copiedUntil.get(session.id) ?? 0) > Date.now();
+            copy.textContent = copied ? "已复制" : "复制最近提问";
+            copy.addEventListener("click", (event) => {
+              event.stopPropagation();
+              void copyRecentPrompts(session, copy);
+            });
+            foot.append(copy);
+            item.append(foot);
+
+            if (open && promptView?.id === session.id) {
               item.append(renderPromptList(promptView));
             }
             return item;
@@ -330,8 +381,14 @@ function render(snapshot: StatusSnapshot) {
 
         if (sessions.length === 0) return [];
         return [groupTitle, ...sessions];
-      }),
-    );
+    });
+    if (rows.length === 0 && query) {
+      const empty = document.createElement("li");
+      empty.className = "session-empty";
+      empty.textContent = "没有匹配的会话";
+      rows.push(empty);
+    }
+    sessionList.replaceChildren(...rows);
     sessionList.scrollTop = scrollTop;
   }
   if (clearSessionsButton) {
@@ -368,6 +425,150 @@ function fitWindowToWidget() {
   const height = Math.ceil(rect.height) + 12;
   if (width >= 48 && height >= 48) {
     invoke("resize_light_to_fit", { width, height }).catch(() => {});
+  }
+}
+
+function headerHaystack(session: SessionSnapshot): string {
+  const summary = summaryById.get(session.id)?.text ?? "";
+  return `${session.title}\n${session.label}\n${session.message}\n${summary}`.toLowerCase();
+}
+
+function sessionVisible(session: SessionSnapshot, query: string): boolean {
+  if (!query) return true;
+  if (headerHaystack(session).includes(query)) return true;
+  const prompts = promptCache.get(session.id);
+  if (!prompts) {
+    ensurePrompts(session);
+    return false;
+  }
+  return prompts.some((item) => item.text.toLowerCase().includes(query));
+}
+
+function promptsFromPage(page: PromptPage): PromptItem[] {
+  if (page.items && page.items.length > 0) return page.items;
+  return page.prompts.map((text) => ({ text, at: 0 }));
+}
+
+async function loadPrompts(session: SessionSnapshot): Promise<PromptItem[]> {
+  if (session.client !== "codex") {
+    promptCache.set(session.id, []);
+    return [];
+  }
+  const page = await invoke<PromptPage>("session_user_prompts", {
+    client: session.client,
+    id: session.id,
+  });
+  const items = promptsFromPage(page);
+  promptCache.set(session.id, items);
+  return items;
+}
+
+function ensurePrompts(session: SessionSnapshot) {
+  if (session.client !== "codex") {
+    if (!promptCache.has(session.id)) promptCache.set(session.id, []);
+    return;
+  }
+  if (promptCache.has(session.id) || promptFlight.has(session.id)) return;
+  promptFlight.add(session.id);
+  void loadPrompts(session)
+    .catch(() => {
+      promptCache.set(session.id, []);
+    })
+    .finally(() => {
+      promptFlight.delete(session.id);
+      if (latestSnapshot) render(latestSnapshot);
+    });
+}
+
+function summaryLine(session: SessionSnapshot): { text: string; pending: boolean } | null {
+  if (session.client !== "codex") return null;
+  const known = summaryById.get(session.id);
+  if (!known) return null;
+  if (known.state === "pending") return { text: "生成中…", pending: true };
+  if (known.state === "ready" && known.text.trim()) {
+    return { text: known.text.trim(), pending: false };
+  }
+  return null;
+}
+
+function ensureSummary(session: SessionSnapshot) {
+  if (session.client !== "codex") return;
+  const known = summaryById.get(session.id);
+  if (known && known.state !== "pending" && known.updatedAt === session.updated_at) return;
+  if (summaryFlight.has(session.id)) return;
+  summaryFlight.add(session.id);
+  void invoke<SummaryPayload>("session_summary", {
+    client: session.client,
+    id: session.id,
+  })
+    .then((page) => {
+      summaryById.set(session.id, {
+        state: page.state,
+        text: page.text,
+        updatedAt: session.updated_at,
+      });
+      if (page.state === "pending") {
+        window.setTimeout(() => {
+          summaryFlight.delete(session.id);
+          if (latestSnapshot) render(latestSnapshot);
+        }, 1000);
+      }
+    })
+    .catch(() => {
+      summaryById.set(session.id, {
+        state: "unavailable",
+        text: "",
+        updatedAt: session.updated_at,
+      });
+    })
+    .finally(() => {
+      const current = summaryById.get(session.id);
+      if (current?.state !== "pending") summaryFlight.delete(session.id);
+      if (latestSnapshot) render(latestSnapshot);
+    });
+}
+
+async function writeClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    // WebView2 can reject the async clipboard API. The selection fallback still works.
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "true");
+  area.style.position = "fixed";
+  area.style.left = "-9999px";
+  document.body.append(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
+async function copyRecentPrompts(session: SessionSnapshot, button: HTMLButtonElement) {
+  button.disabled = true;
+  try {
+    const items = promptCache.get(session.id) ?? (await loadPrompts(session));
+    const text = [...items]
+      .reverse()
+      .slice(0, PREVIEW_PROMPTS)
+      .map((item) => item.text)
+      .join("\n\n");
+    if (!text) {
+      button.textContent = "没有提问";
+    } else {
+      await writeClipboard(text);
+      button.textContent = "已复制";
+    }
+    copiedUntil.set(session.id, Date.now() + 1500);
+    window.setTimeout(() => {
+      if (latestSnapshot) render(latestSnapshot);
+    }, 1500);
+  } catch {
+    button.textContent = "复制失败";
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -463,10 +664,8 @@ async function selectSession(session: SessionSnapshot) {
       id: session.id,
     });
     if (selectedSessionId !== session.id) return;
-    const items =
-      page.items && page.items.length > 0
-        ? page.items
-        : page.prompts.map((text) => ({ text, at: 0 }));
+    const items = promptsFromPage(page);
+    promptCache.set(session.id, items);
     promptView = {
       id: session.id,
       note: page.note,
@@ -527,6 +726,11 @@ setupButton?.addEventListener("click", async () => {
     setupButton.textContent = "安装 Hooks";
     setupButton.disabled = false;
   }
+});
+
+sessionSearch?.addEventListener("input", () => {
+  searchQuery = sessionSearch.value;
+  if (latestSnapshot) render(latestSnapshot);
 });
 
 clearSessionsButton?.addEventListener("click", async () => {
