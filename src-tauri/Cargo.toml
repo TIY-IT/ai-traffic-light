@@ -1,6 +1,6 @@
 [package]
 name = "ai-traffic-light"
-version = "0.1.11"
+version = "0.2.0"
 description = "Floating traffic light for AI coding client conversation status"
 authors = ["pcj1997"]
 edition = "2021"
@@ -9,13 +9,25 @@ edition = "2021"
 name = "ai_traffic_light_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# `cargo build --release` alone yields a dev-mode binary that tries to load
+# devUrl at runtime; production builds must enable this (the tauri CLI does).
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 dirs = "6"
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.37"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tauri-winrt-notification = "0.7"
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "handleapi"] }

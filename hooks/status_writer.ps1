@@ -1,12 +1,13 @@
-param(
-    [ValidateSet("codebuddy", "codex", "claude")]
+﻿param(
+    [ValidateSet("codebuddy", "codex", "claude", "workbuddy")]
     [string]$Client = "codebuddy",
     [Parameter(Mandatory = $true)]
     [ValidateSet("idle", "working", "waiting", "completed", "error")]
     [string]$State,
     [string]$Message = "",
     [switch]$NotificationOnly,
-    [switch]$EmitEmptyJson
+    [switch]$EmitEmptyJson,
+    [string]$StateDirectory
 )
 
 $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
@@ -17,7 +18,24 @@ try {
     # Some hosts do not expose a mutable console; file output still uses UTF-8 below.
 }
 $OutputEncoding = $utf8WithoutBom
+# Never block on stdin: WorkBuddy may keep the pipe open. Read with a hard 800ms bound.
+$payloadText = ''
+try {
+    if ([Console]::IsInputRedirected) {
+        $task = [Console]::In.ReadToEndAsync()
+        if ($task.Wait(800)) { $payloadText = $task.Result }
+    }
+} catch { }
+# Never block on stdin: hosts may keep the pipe open (WorkBuddy does). Read with a hard 800ms bound.
+$payloadText = ''
+try {
+    if ([Console]::IsInputRedirected) {
+        $task = [Console]::In.ReadToEndAsync()
+        if ($task.Wait(800)) { $payloadText = $task.Result }
+    }
+} catch { }
 $sessionsDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".ai-traffic-light\sessions"
+if ($StateDirectory) { $sessionsDir = $StateDirectory }
 $textWaitingPermission = [regex]::Unescape("\u7b49\u5f85\u6743\u9650\u786e\u8ba4")
 $textWaitingInput = [regex]::Unescape("\u7b49\u5f85\u8865\u5145\u4fe1\u606f")
 $textCompleted = [regex]::Unescape("\u56de\u590d\u5b8c\u6210")
@@ -190,7 +208,7 @@ function Set-EventAwareState {
 }
 
 try {
-    $inputJson = [Console]::In.ReadToEnd()
+    $inputJson = $payloadText
     $eventData = if ($inputJson) { $inputJson | ConvertFrom-Json } else { [PSCustomObject]@{} }
 } catch {
     $eventData = [PSCustomObject]@{}
@@ -217,7 +235,14 @@ if ($NotificationOnly) {
     }
 }
 
-Set-EventAwareState $eventData
+if ($Client -in @('codex','workbuddy')) {
+    if (-not (Get-EventValue $eventData 'session_id') -and -not (Get-EventValue $eventData 'conversation_id')) {
+        if ($EmitEmptyJson) { [Console]::Out.WriteLine('{}') }
+        exit 0
+    }
+} else {
+    Set-EventAwareState $eventData
+}
 New-Item -ItemType Directory -Path $sessionsDir -Force | Out-Null
 $sessionFile = Join-Path $sessionsDir "$Client-$(Get-SafeSessionId $eventData).json"
 

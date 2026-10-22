@@ -9,6 +9,20 @@ const PROCESSING_STALE_SECS: u64 = 30 * 60;
 const INACTIVE_STALE_SECS: u64 = 24 * 60 * 60;
 const CLIENTS: [&str; 3] = ["codebuddy", "codex", "claude"];
 
+// Probe expressions ship as plain text files next to the exe so they can be replaced on a
+// remote machine without rebuilding; the compiled copy is the fallback when the file is absent.
+pub(crate) fn resource(name: &str, embedded: &str) -> String {
+    let mut text = embedded.to_string();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        if let Ok(data) = fs::read(dir.join(name)) {
+            let loaded = String::from_utf8_lossy(&data);
+            let trimmed = loaded.trim_start_matches('\u{feff}').trim();
+            if !trimmed.is_empty() { text = trimmed.to_string(); }
+        }
+    }
+    text
+}
+
 fn default_client() -> String {
     "codebuddy".to_string()
 }
@@ -69,7 +83,7 @@ struct SessionData {
     created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub id: String,
     pub client: String,

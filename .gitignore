@@ -6,3 +6,11 @@ __pycache__
 *.pyc
 .DS_Store
 *.log
+src-tauri/resources/data/
+releases/
+.codex-protocol-diagnostic/
+
+team-server-demo/admin-token.txt
+.zcode/
+tmp-pkg-test/
+

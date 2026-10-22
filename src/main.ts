@@ -1,10 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
-import {
-  currentMonitor,
-  getCurrentWindow,
-  PhysicalPosition,
-} from "@tauri-apps/api/window";
 import "./styles.css";
+import { setupPanelControls } from "./panel-controls";
+
+setupPanelControls();
 
 type Status =
   | "idle"
@@ -33,7 +31,7 @@ interface SessionSnapshot {
   created_at: number;
 }
 
-const lights = Array.from(document.querySelectorAll<HTMLElement>(".light"));
+const housings = Array.from(document.querySelectorAll<HTMLElement>(".housing"));
 const statusLabel = document.querySelector<HTMLElement>("#status-label");
 const sessionCount = document.querySelector<HTMLElement>("#session-count");
 const sessionList = document.querySelector<HTMLUListElement>("#session-list");
@@ -45,59 +43,198 @@ const hooksStatus = document.querySelector<HTMLElement>("#hooks-status");
 const setupButton = document.querySelector<HTMLButtonElement>("#setup-hooks");
 const clearSessionsButton =
   document.querySelector<HTMLButtonElement>("#clear-sessions");
-const appWindow = getCurrentWindow();
-const panelShift = 158;
+const freshChip = document.querySelector<HTMLElement>("#fresh-chip");
 let hooksSuccessVisibleUntil = 0;
-let panelPlacementChanging = false;
 
 function clientLabel(client: string) {
+  if (client === "zcode") return "ZCode";
+  if (client === "coze") return "扣子";
+  if (client === "trae") return "TRAE";
+  if (client === "doubao") return "豆包";
+  if (client === "marvis") return "Marvis";
+  if (client === "workbuddy") return "WorkBuddy";
   if (client === "codex") return "Codex";
   if (client === "claude") return "Claude";
   return "CodeBuddy";
 }
 
-async function updatePanelPlacement(position?: PhysicalPosition) {
-  if (panelPlacementChanging) return;
+const stateBadgeText: Record<Status, string> = {
+  working: "运行中",
+  completed: "已结束",
+  waiting: "待处理",
+  error: "异常",
+  idle: "空闲",
+};
 
-  const [windowPosition, monitor, scaleFactor] = await Promise.all([
-    position ? Promise.resolve(position) : appWindow.outerPosition(),
-    currentMonitor(),
-    appWindow.scaleFactor(),
-  ]);
-  if (!monitor) return;
+// 红灯"新鲜度"阈值:15 分钟内结束的会话才点亮红灯,更早的已停不再长红。
+const FRESH_STOP_SECS = 15 * 60;
+const ENDED_STATES: Status[] = ["completed", "waiting", "error"];
 
-  const panelOnLeft = document.body.dataset.panelSide === "left";
-  const housingCenter =
-    windowPosition.x + (40 + (panelOnLeft ? panelShift : 0)) * scaleFactor;
-  const monitorCenter =
-    monitor.workArea.position.x + monitor.workArea.size.width / 2;
-  const shouldPlacePanelOnLeft = housingCenter > monitorCenter;
-  if (panelOnLeft === shouldPlacePanelOnLeft) return;
+// 前端自测的结束提醒:模块级保存上一帧状态(id → state),首轮 render 只播种。
+const prevState = new Map<string, string>();
+let prevStateSeeded = false;
+const attnTimers = new Map<string, number>();
 
-  document.body.dataset.panelSide = shouldPlacePanelOnLeft ? "left" : "right";
-  panelPlacementChanging = true;
+let audioCtx: AudioContext | null = null;
+
+// WebView2 的自动播放策略可能把 AudioContext 挂起:监听用户点击并尝试恢复。
+// 不能用 {once:true}:ctx 是懒创建的,首次点击时可能还不存在。
+document.addEventListener("pointerdown", () => {
+  if (audioCtx && audioCtx.state === "suspended") {
+    void audioCtx.resume().catch(() => {});
+  }
+});
+
+function ensureAudioCtx(): AudioContext {
+  if (!audioCtx) audioCtx = new AudioContext();
+  return audioCtx;
+}
+
+// 两声短音(880Hz→660Hz),总时长约 0.3s,gain 峰值 0.12 指数衰减;失败静默。
+async function playDing() {
   try {
-    const offset = (shouldPlacePanelOnLeft ? -panelShift : panelShift) * scaleFactor;
-    await appWindow.setPosition(
-      new PhysicalPosition(windowPosition.x + offset, windowPosition.y),
-    );
-  } finally {
-    panelPlacementChanging = false;
+    if (!(await invoke<boolean>("notify_enabled"))) return;
+    const ctx = ensureAudioCtx();
+    if (ctx.state !== "running") return;
+    const start = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.3);
+    gain.connect(ctx.destination);
+    const tones: Array<[number, number]> = [
+      [0, 880],
+      [0.14, 660],
+    ];
+    for (const [offset, freq] of tones) {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      osc.connect(gain);
+      osc.start(start + offset);
+      osc.stop(start + offset + 0.14);
+    }
+    window.setTimeout(() => gain.disconnect(), 500);
+  } catch {
+    // 提示音失败不影响状态灯。
   }
 }
 
-function render(snapshot: StatusSnapshot) {
+// 该 client 红灯闪烁 6 秒;重复触发先清旧 timer 再重新计时。
+function flashAttn(housing: HTMLElement) {
+  const red = housing.querySelector<HTMLElement>(".light-red");
+  if (!red) return;
+  const client = housing.dataset.client || "";
+  const previous = attnTimers.get(client);
+  if (previous !== undefined) clearTimeout(previous);
+  red.classList.add("attn");
+  attnTimers.set(
+    client,
+    window.setTimeout(() => {
+      red.classList.remove("attn");
+      attnTimers.delete(client);
+    }, 6000),
+  );
+}
+
+// Click-through map: the backend only accepts mouse events inside these
+// window-relative logical rects, so empty transparent areas stop blocking
+// clicks to windows underneath.
+const panelStack = document.querySelector<HTMLElement>(".panel-stack");
+let lastHitRegions = "";
+
+function publishHitRegions() {
+  const rects: Array<[number, number, number, number]> = [];
+  const pushRect = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      rects.push([rect.left, rect.top, rect.width, rect.height]);
+    }
+  };
+  housings.forEach((housing) => {
+    if (!housing.hidden) pushRect(housing);
+  });
+  if (panelStack && getComputedStyle(panelStack).display !== "none") {
+    panelStack.querySelectorAll<HTMLElement>(".panel").forEach((panel) => {
+      if (!panel.hidden) pushRect(panel);
+    });
+  }
+  const key = JSON.stringify(rects);
+  if (key === lastHitRegions) return;
+  lastHitRegions = key;
+  invoke("set_hit_regions", { rects }).catch(() => {});
+}
+
+function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy", "marvis", "zcode", "coze", "trae", "doubao"]) {
+  snapshot = {...snapshot, sessions: snapshot.sessions.filter(s => activeClients.includes(s.client))};
+  snapshot.session_count = snapshot.sessions.length;
+
+  // 红灯语义 = "新鲜度":只有 15 分钟内结束的会话才点亮红灯,更早的视为陈旧。
+  const nowSecs = Date.now() / 1000;
+  const isEnded = (s: SessionSnapshot) => ENDED_STATES.includes(s.state);
+  const isFresh = (s: SessionSnapshot) =>
+    isEnded(s) && nowSecs - s.updated_at <= FRESH_STOP_SECS;
+  const hasRunning = snapshot.sessions.some((s) => s.state === "working");
+  snapshot.label = hasRunning
+    ? "运行中"
+    : snapshot.sessions.some(isFresh)
+      ? "有会话刚结束"
+      : snapshot.sessions.some((s) => s.state !== "idle")
+        ? "已停止 · 查看结果"
+        : "暂无会话状态";
   document.body.dataset.state = snapshot.state;
 
-  for (const light of lights) {
-    light.classList.toggle("active", light.dataset.state === snapshot.state);
+  // 对比上一帧:working → 结束态的会话触发提醒(首轮只播种,不提醒)。
+  const justEndedClients = new Set<string>();
+  if (prevStateSeeded) {
+    for (const session of snapshot.sessions) {
+      if (prevState.get(session.id) === "working" && isEnded(session)) {
+        justEndedClients.add(session.client);
+      }
+    }
+  }
+
+  for (const housing of housings) {
+    housing.hidden = !activeClients.includes(housing.dataset.client || "");
+    const sessions = snapshot.sessions.filter(s => s.client === housing.dataset.client);
+    const running = sessions.filter((s) => s.state === "working").length;
+    const freshStopped = sessions.filter(isFresh).length;
+    const staleStopped = sessions.filter(isEnded).length - freshStopped;
+    const colorState = running ? "completed" : freshStopped ? "waiting" : "idle";
+    housing.querySelectorAll<HTMLElement>(".light").forEach(light => {
+      light.classList.toggle("active", light.dataset.state === colorState);
+    });
+    const label = housing.querySelector<HTMLElement>(".client-status");
+    if (label) {
+      label.textContent = running
+        ? `${running} 运行${freshStopped ? ` · ${freshStopped} 新停` : ""}`
+        : freshStopped
+          ? `刚结束 ${freshStopped}`
+          : staleStopped > 0
+            ? `已停 ${staleStopped}`
+            : "暂无状态";
+    }
+    housing.setAttribute("aria-label", `${clientLabel(housing.dataset.client || "")}：${label?.textContent}`);
+    if (justEndedClients.has(housing.dataset.client || "")) flashAttn(housing);
+  }
+
+  const freshTotal = snapshot.sessions.filter(isFresh).length;
+  if (freshChip) {
+    freshChip.textContent = `刚结束 ${freshTotal}`;
+    freshChip.hidden = freshTotal === 0;
   }
 
   if (statusLabel) statusLabel.textContent = snapshot.label;
   if (sessionCount) {
+    const runningTotal = snapshot.sessions.filter(
+      (session) => session.state === "working",
+    ).length;
+    const stoppedTotal = snapshot.sessions.filter((session) =>
+      ["completed", "waiting", "error"].includes(session.state),
+    ).length;
     sessionCount.textContent =
       snapshot.session_count > 0
-        ? `${snapshot.session_count} 个会话状态`
+        ? `${runningTotal} 运行 · ${stoppedTotal} 已停`
         : "暂无会话记录";
   }
   if (sessionList) {
@@ -120,6 +257,12 @@ function render(snapshot: StatusSnapshot) {
 
         const sessions = snapshot.sessions
           .filter((session) => session.client === client)
+          // 组内排序:运行中的排最前,其余按 updated_at 倒序(最新在前)。
+          .sort(
+            (left, right) =>
+              Number(right.state === "working") - Number(left.state === "working") ||
+              right.updated_at - left.updated_at,
+          )
           .map((session) => {
             const item = document.createElement("li");
             item.className = `session-item session-${session.state}`;
@@ -127,8 +270,9 @@ function render(snapshot: StatusSnapshot) {
             const dot = document.createElement("span");
             dot.className = "session-dot";
 
-            const content = document.createElement("span");
-            content.className = "session-content";
+            const badge = document.createElement("span");
+            badge.className = "session-state-badge";
+            badge.textContent = stateBadgeText[session.state];
 
             const remove = document.createElement("button");
             remove.className = "session-remove";
@@ -142,18 +286,21 @@ function render(snapshot: StatusSnapshot) {
               await refresh();
             });
 
+            // 单行布局:标题是唯一内容行,message/label 副行不再渲染。
             const heading = document.createElement("span");
             heading.className = "session-heading";
 
             const title = document.createElement("strong");
             title.textContent = session.title;
 
-            const message = document.createElement("span");
-            message.textContent = session.message || session.label;
-
+            remove.hidden = true;
+            // 点击会话行把该会话所属的 AI 客户端窗口调到前台;失败静默。
+            item.title = "点击切换到该会话窗口";
+            item.addEventListener("click", () => {
+              invoke("focus_session", { client: session.client, id: session.id }).catch(() => {});
+            });
             heading.append(title);
-            content.append(heading, message);
-            item.append(dot, content, remove);
+            item.append(dot, heading, badge, remove);
             return item;
           });
 
@@ -162,32 +309,43 @@ function render(snapshot: StatusSnapshot) {
     );
   }
   if (clearSessionsButton) {
-    clearSessionsButton.hidden = snapshot.session_count === 0;
+    // 快照里存在已结束会话时才显示"清空已停"入口。
+    clearSessionsButton.hidden = !snapshot.sessions.some(isEnded);
   }
+  // 每轮 render 末尾整体更新上一帧状态表,作为下一轮的比对基准。
+  prevState.clear();
+  for (const session of snapshot.sessions) {
+    prevState.set(session.id, session.state);
+  }
+  prevStateSeeded = true;
+  if (justEndedClients.size > 0) void playDing();
+  // Keep the window width hugging the visible content (no invisible dead strip):
+  // rightmost lamp housing, or the expanded panel stack when present.
+  const rights: number[] = [];
+  housings.forEach((housing) => {
+    if (housing.hidden) return;
+    const rect = housing.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) rights.push(rect.right);
+  });
+  if (panelStack && getComputedStyle(panelStack).display !== "none") {
+    rights.push(panelStack.getBoundingClientRect().right);
+  }
+  const needWidth = rights.length ? Math.max(...rights) + 14 : 0;
+  if (needWidth > 0) invoke("resize_light_to_fit", { width: needWidth }).catch(() => {});
+  publishHitRegions();
 }
 
 async function refresh() {
   try {
-    render(await invoke<StatusSnapshot>("get_status"));
+    const [snapshot, clients] = await Promise.all([invoke<StatusSnapshot>("get_status"), invoke<string[]>("get_active_clients")]);
+    render(snapshot, clients);
   } catch (error) {
     console.error("Failed to refresh AI client status", error);
   }
 }
 
 async function refreshHooksStatus() {
-  if (!hooksWarning) return;
-  try {
-    const installed = await invoke<boolean>("hooks_installed");
-    const showSuccess = installed && Date.now() < hooksSuccessVisibleUntil;
-    hooksWarning.hidden = installed && !showSuccess;
-    if (hooksWarningMessage) hooksWarningMessage.hidden = installed;
-    if (setupButton) setupButton.hidden = installed;
-  } catch (error) {
-    hooksWarning.hidden = false;
-    if (hooksWarningMessage) hooksWarningMessage.hidden = false;
-    if (setupButton) setupButton.hidden = false;
-    console.error("Failed to refresh Hooks status", error);
-  }
+  if (hooksWarning) hooksWarning.hidden = true;
 }
 
 function setHooksStatus(message: string, state: "busy" | "error" | "success") {
@@ -227,15 +385,106 @@ clearSessionsButton?.addEventListener("click", async () => {
   }
 });
 
+interface TeamConfig {
+  enabled: boolean;
+  server_url: string;
+  display_name: string;
+  device_token: string;
+  interval_secs: number;
+}
+
+interface ReportStatus {
+  last_ok: number;
+  last_attempt: number;
+  last_error: string | null;
+}
+
+const teamPanel = document.querySelector<HTMLElement>("#team-panel");
+const teamEnabled = document.querySelector<HTMLInputElement>("#team-enabled");
+const teamUrl = document.querySelector<HTMLInputElement>("#team-url");
+const teamName = document.querySelector<HTMLInputElement>("#team-name");
+const teamSave = document.querySelector<HTMLButtonElement>("#team-save");
+const teamStatus = document.querySelector<HTMLElement>("#team-status");
+const openTeamButton = document.querySelector<HTMLButtonElement>("#open-team");
+const closeTeamButton = document.querySelector<HTMLButtonElement>("#close-team");
+let latestTeamConfig: TeamConfig | null = null;
+
+function setTeamStatus(text: string, state?: "ok" | "error") {
+  if (!teamStatus) return;
+  teamStatus.textContent = text;
+  if (state) teamStatus.dataset.state = state;
+  else delete teamStatus.dataset.state;
+}
+
+function sinceText(secs: number) {
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  return elapsed < 60 ? `${elapsed} 秒前` : `${Math.floor(elapsed / 60)} 分钟前`;
+}
+
+async function refreshTeamConfig() {
+  if (!teamPanel || teamPanel.hidden) return;
+  try {
+    const [config, status] = await Promise.all([
+      invoke<TeamConfig>("get_team_config"),
+      invoke<ReportStatus>("report_status"),
+    ]);
+    latestTeamConfig = config;
+    if (teamUrl && document.activeElement !== teamUrl) teamUrl.value = config.server_url;
+    if (teamName && document.activeElement !== teamName) teamName.value = config.display_name;
+    if (teamEnabled) teamEnabled.checked = config.enabled;
+    if (!config.enabled) setTeamStatus("未启用");
+    else if (status.last_error) setTeamStatus(`上报失败:${status.last_error}`, "error");
+    else if (status.last_ok) setTeamStatus(`已上报 · ${sinceText(status.last_ok)}`, "ok");
+    else setTeamStatus("等待首次上报…");
+  } catch (error) {
+    console.error("Failed to load team config", error);
+  }
+}
+
+openTeamButton?.addEventListener("click", () => {
+  if (!teamPanel) return;
+  teamPanel.hidden = false;
+  publishHitRegions();
+  refreshTeamConfig();
+});
+
+closeTeamButton?.addEventListener("click", () => {
+  if (teamPanel) teamPanel.hidden = true;
+  publishHitRegions();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && teamPanel && !teamPanel.hidden) {
+    teamPanel.hidden = true;
+    publishHitRegions();
+  }
+});
+
+teamSave?.addEventListener("click", async () => {
+  if (!teamSave || !teamEnabled) return;
+  teamSave.disabled = true;
+  setTeamStatus("保存中…");
+  try {
+    const merged: TeamConfig = {
+      enabled: teamEnabled.checked,
+      server_url: teamUrl?.value ?? "",
+      display_name: teamName?.value ?? "",
+      device_token: latestTeamConfig?.device_token ?? "",
+      interval_secs: latestTeamConfig?.interval_secs ?? 30,
+    };
+    await invoke<TeamConfig>("set_team_config", { config: merged });
+    setTeamStatus(teamEnabled.checked ? "已保存,正在上报…" : "已保存,上报关闭", "ok");
+  } catch (error) {
+    setTeamStatus(`保存失败:${String(error)}`, "error");
+  } finally {
+    teamSave.disabled = false;
+  }
+});
+
 refresh();
 refreshHooksStatus();
-updatePanelPlacement().catch((error) => {
-  console.error("Failed to update panel placement", error);
-});
-appWindow.onMoved(({ payload }) => {
-  updatePanelPlacement(payload).catch((error) => {
-    console.error("Failed to update panel placement", error);
-  });
-});
-window.setInterval(refresh, 500);
+publishHitRegions();
+document.addEventListener("hit-regions-dirty", () => publishHitRegions());
+window.setInterval(refresh, 200);
 window.setInterval(refreshHooksStatus, 5000);
+window.setInterval(refreshTeamConfig, 5000);
