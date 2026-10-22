@@ -547,6 +547,9 @@ teamSave?.addEventListener("click", async () => {
 refresh();
 refreshHooksStatus();
 publishHitRegions();
+// The shell shows the window without waiting for this. A custom-protocol
+// miss must not leave the HWND hidden.
+invoke("window_ready").catch(() => {});
 document.addEventListener("hit-regions-dirty", () => publishHitRegions());
 window.setInterval(refresh, 200);
 window.setInterval(refreshHooksStatus, 5000);

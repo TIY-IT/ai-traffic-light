@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "visible": false,
+        "visible": true,
         "title": "AI Traffic Light",
         "width": 780,
         "height": 480,

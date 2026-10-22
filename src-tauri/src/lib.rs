@@ -14,10 +14,10 @@ mod workbuddy_local;
 mod zcode;
 
 use sessions::{clear_sessions, delete_session, StatusSnapshot};
-use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{
     image::Image,
     menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
@@ -69,8 +69,8 @@ fn focus_session(client: String, id: String) -> Result<(), String> {
     focus::focus_session(&client, &id)
 }
 
-// Gap between the window and the monitor's top-right corner, in physical px.
-// v2 replaces the old absolute "x,y" file, which could reopen as a 16×16 sliver.
+// Gap between the window and the primary work area's top-right, in logical px.
+// Launch multiplies this by that monitor's own scale factor (physical px).
 const DEFAULT_INSET: f64 = 16.0;
 const MIN_LOGICAL_W: f64 = 240.0;
 const MAX_LOGICAL_W: f64 = 920.0;
@@ -91,76 +91,6 @@ struct MonitorBox {
 struct WindowBox {
     w: f64,
     h: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Anchor {
-    inset_right: f64,
-    inset_top: f64,
-    mon_x: Option<f64>,
-    mon_y: Option<f64>,
-}
-
-fn window_pos_file(app: &AppHandle) -> Option<std::path::PathBuf> {
-    app.path()
-        .resolve(
-            ".ai-traffic-light/window-pos.json",
-            tauri::path::BaseDirectory::Home,
-        )
-        .ok()
-}
-
-fn parse_anchor(text: &str) -> Option<Anchor> {
-    let mut parts = text.trim().split(',');
-    if parts.next()?.trim() != "v2" {
-        return None;
-    }
-    let inset_right: f64 = parts.next()?.trim().parse().ok()?;
-    let inset_top: f64 = parts.next()?.trim().parse().ok()?;
-    if !inset_right.is_finite() || !inset_top.is_finite() {
-        return None;
-    }
-    let mon_x = parts
-        .next()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite());
-    let mon_y = parts
-        .next()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite());
-    Some(Anchor {
-        inset_right,
-        inset_top,
-        mon_x,
-        mon_y,
-    })
-}
-
-fn pick_monitor(
-    monitors: &[MonitorBox],
-    saved_x: Option<f64>,
-    saved_y: Option<f64>,
-) -> Option<MonitorBox> {
-    if monitors.is_empty() {
-        return None;
-    }
-    if let (Some(sx), Some(sy)) = (saved_x, saved_y) {
-        if let Some(found) = monitors
-            .iter()
-            .copied()
-            .find(|mon| (mon.x - sx).abs() < 2.0 && (mon.y - sy).abs() < 2.0)
-        {
-            return Some(found);
-        }
-        if let Some(found) = monitors
-            .iter()
-            .copied()
-            .find(|mon| sx >= mon.x && sx < mon.x + mon.w && sy >= mon.y && sy < mon.y + mon.h)
-        {
-            return Some(found);
-        }
-    }
-    Some(monitors[0])
 }
 
 fn clamp_on_monitor(mon: MonitorBox, win: WindowBox, x: f64, y: f64) -> (f64, f64) {
@@ -225,103 +155,302 @@ fn should_ignore_cursor(has_regions: bool, inside_window: bool, in_region: bool)
     !in_region
 }
 
-fn monitor_box(monitor: &tauri::Monitor) -> MonitorBox {
+/// Top-right of a work area in physical pixels. `scale` is that monitor's
+/// DPI scale, not a stale window scale. Origins may be negative.
+fn top_right_on_work(
+    work: MonitorBox,
+    win: WindowBox,
+    inset_logical: f64,
+    scale: f64,
+) -> (f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let inset = (inset_logical * scale).round();
+    anchored_position(work, win, inset, inset, inset)
+}
+
+/// `available` entries are `(full bounds, work area)`. Prefer the primary
+/// monitor's work area. If that query failed, use the display that contains
+/// the origin, then the first display. Never require a non-negative origin.
+fn pick_primary_work(
+    primary: Option<MonitorBox>,
+    available: &[(MonitorBox, MonitorBox)],
+) -> Option<MonitorBox> {
+    if let Some(work) = primary {
+        return Some(work);
+    }
+    if let Some((_, work)) = available.iter().copied().find(|(full, _)| {
+        full.x <= 0.0 && full.y <= 0.0 && full.x + full.w > 0.0 && full.y + full.h > 0.0
+    }) {
+        return Some(work);
+    }
+    available.first().map(|(_, work)| *work)
+}
+
+fn monitor_rects(monitor: &tauri::Monitor) -> (MonitorBox, MonitorBox, f64) {
     let pos = monitor.position();
     let size = monitor.size();
-    MonitorBox {
+    let full = MonitorBox {
         x: pos.x as f64,
         y: pos.y as f64,
         w: size.width as f64,
         h: size.height as f64,
+    };
+    let area = monitor.work_area();
+    let work = MonitorBox {
+        x: area.position.x as f64,
+        y: area.position.y as f64,
+        w: area.size.width as f64,
+        h: area.size.height as f64,
+    };
+    let scale = monitor.scale_factor();
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (full, work, scale)
+}
+
+fn primary_work(window: &tauri::WebviewWindow) -> Option<(MonitorBox, f64)> {
+    let primary = window.primary_monitor().ok().flatten();
+    let (primary_work, primary_scale) = match primary.as_ref() {
+        Some(monitor) => {
+            let (_, work, scale) = monitor_rects(monitor);
+            (Some(work), Some(scale))
+        }
+        None => (None, None),
+    };
+    let mut available = Vec::new();
+    if let Ok(monitors) = window.available_monitors() {
+        for monitor in monitors {
+            let (full, work, _) = monitor_rects(&monitor);
+            available.push((full, work));
+        }
+    }
+    let work = pick_primary_work(primary_work, &available)?;
+    let scale = primary_scale.unwrap_or_else(|| {
+        window
+            .available_monitors()
+            .ok()
+            .and_then(|monitors| {
+                monitors.iter().find_map(|monitor| {
+                    let (_, candidate, scale) = monitor_rects(monitor);
+                    ((candidate.x - work.x).abs() < 2.0 && (candidate.y - work.y).abs() < 2.0)
+                        .then_some(scale)
+                })
+            })
+            .unwrap_or(1.0)
+    });
+    Some((work, scale))
+}
+
+// Moves that we issued ourselves. A later Moved event at the same point is
+// not a user drag, so launch retries can still correct a restored placement.
+static PROGRAMMATIC_POS: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
+static USER_DRAGGED: AtomicBool = AtomicBool::new(false);
+static LAUNCH_AT: OnceLock<Instant> = OnceLock::new();
+
+fn launch_clock() -> Instant {
+    *LAUNCH_AT.get_or_init(Instant::now)
+}
+
+fn note_programmatic_pos(x: f64, y: f64) {
+    if let Ok(mut guard) = PROGRAMMATIC_POS.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some((x.round() as i32, y.round() as i32));
     }
 }
 
-fn show_anchored_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
-        return;
+fn is_programmatic_move(x: f64, y: f64) -> bool {
+    let Some(slot) = PROGRAMMATIC_POS.get() else {
+        return false;
     };
-    let _ = window.set_size(tauri::LogicalSize::new(START_LOGICAL_W, START_LOGICAL_H));
-    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
-    let anchor = window_pos_file(app)
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| parse_anchor(&text))
-        .unwrap_or(Anchor {
-            inset_right: DEFAULT_INSET * scale,
-            inset_top: DEFAULT_INSET * scale,
-            mon_x: None,
-            mon_y: None,
-        });
-    let mut monitors = Vec::new();
-    if let Ok(Some(primary)) = window.primary_monitor() {
-        monitors.push(monitor_box(&primary));
+    let Ok(guard) = slot.lock() else {
+        return false;
+    };
+    let Some((px, py)) = *guard else {
+        return false;
+    };
+    (x.round() as i32 - px).abs() <= 4 && (y.round() as i32 - py).abs() <= 4
+}
+
+fn pointer_is_down() -> bool {
+    #[cfg(windows)]
+    {
+        // High bit set means the left button is down. A placement restore
+        // moves the window without a button, so it must not count as a drag.
+        unsafe { winapi::um::winuser::GetAsyncKeyState(0x01) < 0 }
     }
-    if let Ok(available) = window.available_monitors() {
-        for monitor in available {
-            let next = monitor_box(&monitor);
-            if !monitors.iter().any(|item: &MonitorBox| {
-                (item.x - next.x).abs() < 2.0 && (item.y - next.y).abs() < 2.0
-            }) {
-                monitors.push(next);
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+fn note_user_drag(x: f64, y: f64) {
+    if is_programmatic_move(x, y) || !pointer_is_down() {
+        return;
+    }
+    USER_DRAGGED.store(true, Ordering::Relaxed);
+}
+
+fn launch_should_place() -> bool {
+    !USER_DRAGGED.load(Ordering::Relaxed) && launch_clock().elapsed() < Duration::from_millis(1600)
+}
+
+fn main_window_hidden(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .map(|visible| !visible)
+        .unwrap_or(true)
+}
+
+fn launch_physical_size(scale: f64, reset_to_start: bool) -> (f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    if !reset_to_start {
+        if let Some(slot) = LAST_FIT.get() {
+            if let Ok(fitted) = slot.lock() {
+                if fitted.0 >= MIN_LOGICAL_W as i32 && fitted.1 >= MIN_LOGICAL_H as i32 {
+                    return (fitted.0 as f64 * scale, fitted.1 as f64 * scale);
+                }
             }
         }
     }
-    let win = WindowBox {
-        w: START_LOGICAL_W * scale,
-        h: START_LOGICAL_H * scale,
-    };
-    if let Some(mon) = pick_monitor(&monitors, anchor.mon_x, anchor.mon_y) {
-        let (x, y) = anchored_position(
-            mon,
-            win,
-            anchor.inset_right,
-            anchor.inset_top,
-            DEFAULT_INSET * scale,
-        );
-        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-    }
-    let _ = window.show();
+    (START_LOGICAL_W * scale, START_LOGICAL_H * scale)
 }
 
-fn save_window_anchor(app: &AppHandle, x: f64, y: f64) {
+fn place_primary_top_right(
+    window: &tauri::WebviewWindow,
+    reset_to_start: bool,
+) -> Option<(i32, i32, i32, i32)> {
+    let (work, scale) = primary_work(window)?;
+    let (width, height) = launch_physical_size(scale, reset_to_start);
+    if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        return None;
+    }
+    let (x, y) = top_right_on_work(
+        work,
+        WindowBox {
+            w: width,
+            h: height,
+        },
+        DEFAULT_INSET,
+        scale,
+    );
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let _ = window.set_size(tauri::PhysicalSize::new(
+        width.round() as u32,
+        height.round() as u32,
+    ));
+    note_programmatic_pos(x, y);
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    Some((
+        x.round() as i32,
+        y.round() as i32,
+        width.round() as i32,
+        height.round() as i32,
+    ))
+}
+
+/// Show the main window. `place` pins it to the primary work area's top-right.
+/// Positioning failure still shows and focuses. The frontend `window_ready`
+/// invoke is not a gate: the page may never load in a release build.
+fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let Ok(size) = window.outer_size() else {
-        return;
+    let needs_focus = place || window.is_visible().ok() != Some(true);
+    let placed = if place {
+        place_primary_top_right(&window, reset_to_start)
+    } else {
+        None
     };
-    if size.width < 64 || size.height < 64 {
-        return;
+    let _ = window.unminimize();
+    let _ = window.show();
+    #[cfg(windows)]
+    if let Ok(hwnd) = window.hwnd() {
+        // tao's Show path calls SetWindowPos(SWP_FRAMECHANGED) without
+        // SWP_SHOWWINDOW, which clears WS_VISIBLE on a window that was born
+        // hidden. Force the bit after that style refresh.
+        force_show_win32(hwnd.0, placed, needs_focus);
     }
-    let Ok(monitors) = window.available_monitors() else {
-        return;
-    };
-    let boxes: Vec<MonitorBox> = monitors.iter().map(monitor_box).collect();
-    let corner_x = x + size.width as f64;
-    let Some(mon) = boxes
-        .iter()
-        .copied()
-        .find(|mon| {
-            corner_x >= mon.x && corner_x <= mon.x + mon.w && y >= mon.y && y <= mon.y + mon.h
-        })
-        .or_else(|| boxes.first().copied())
-    else {
-        return;
-    };
-    let Some(file) = window_pos_file(app) else {
-        return;
-    };
-    if let Some(parent) = file.parent() {
-        let _ = fs::create_dir_all(parent);
+    #[cfg(not(windows))]
+    let _ = placed;
+    if needs_focus {
+        let _ = window.set_focus();
     }
-    let inset_right = mon.x + mon.w - corner_x;
-    let inset_top = y - mon.y;
-    let _ = fs::write(
-        file,
-        format!(
-            "v2,{},{},{},{}",
-            inset_right as i32, inset_top as i32, mon.x as i32, mon.y as i32
-        ),
-    );
+}
+
+fn schedule_present(app: AppHandle, delay_ms: u64) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(delay_ms));
+        let queued = app.clone();
+        let for_task = queued.clone();
+        if app
+            .run_on_main_thread(move || {
+                let place = main_window_hidden(&for_task) || launch_should_place();
+                present_main_window(&for_task, place, false);
+            })
+            .is_err()
+        {
+            let _ = queued.get_webview_window("main").map(|window| {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            });
+        }
+    });
+}
+
+#[cfg(windows)]
+fn force_show_win32(raw: *mut std::ffi::c_void, place: Option<(i32, i32, i32, i32)>, focus: bool) {
+    use winapi::shared::minwindef::LPARAM;
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{
+        EnumChildWindows, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, SW_SHOWNA,
+    };
+
+    let hwnd = raw as HWND;
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        ShowWindow(hwnd, if focus { SW_SHOW } else { SW_SHOWNA });
+        if let Some((x, y, width, height)) = place {
+            // After ShowWindow, so a restored WINDOWPLACEMENT cannot put the
+            // old rect (or SW_HIDE) back.
+            let mut flags = SWP_SHOWWINDOW;
+            if !focus {
+                flags |= SWP_NOACTIVATE;
+            }
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, width.max(1), height.max(1), flags);
+        }
+        EnumChildWindows(hwnd, Some(show_child_window), 0 as LPARAM);
+        if focus {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn show_child_window(
+    hwnd: winapi::shared::windef::HWND,
+    _: winapi::shared::minwindef::LPARAM,
+) -> i32 {
+    // The WebView2 child is created without WS_VISIBLE when the window config
+    // says visible:false. WebviewWindow::show does not flip that child.
+    winapi::um::winuser::ShowWindow(hwnd, winapi::um::winuser::SW_SHOW);
+    1
 }
 
 static LAST_FIT: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
@@ -353,6 +482,7 @@ fn resize_light_to_fit(window: tauri::WebviewWindow, width: f64, height: f64) {
     let _ = window.set_size(tauri::LogicalSize::new(want_w, want_h));
     if let Some(pos) = pos {
         let new_x = right_edge_x(pos.x as f64, old_w_phys, want_w * scale);
+        note_programmatic_pos(new_x, pos.y as f64);
         let _ = window.set_position(tauri::PhysicalPosition::new(new_x, pos.y as f64));
     }
 }
@@ -438,9 +568,27 @@ fn tray_icon(state: &str) -> Image<'static> {
 }
 
 fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+    let place = main_window_hidden(app) || launch_should_place();
+    present_main_window(app, place, false);
+}
+
+// Page load is not required. If this never arrives (missing dist, custom
+// protocol, or a blank webview), the launch timers still show the window.
+#[tauri::command]
+fn window_ready(app: AppHandle) {
+    let queued = app.clone();
+    if app
+        .run_on_main_thread(move || {
+            let place = main_window_hidden(&queued) || launch_should_place();
+            present_main_window(&queued, place, false);
+        })
+        .is_err()
+    {
+        let _ = app.get_webview_window("main").map(|window| {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        });
     }
 }
 
@@ -451,11 +599,11 @@ pub fn run() {
         // autostart entry) exits here and just raises the existing window instead
         // of stacking another lamp.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            let queued = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let place = main_window_hidden(&queued) || launch_should_place();
+                present_main_window(&queued, place, false);
+            });
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -466,6 +614,7 @@ pub fn run() {
             get_status,
             session_user_prompts,
             resize_light_to_fit,
+            window_ready,
             set_hit_regions,
             notify_enabled,
             focus_session,
@@ -493,18 +642,23 @@ pub fn run() {
             reporter::start();
             notify::start(app.handle().clone());
 
-            // Remember drags, then show a real window at the top-right before any
-            // presence check can hide it. The handler is attached first so the
-            // initial placement is what gets saved.
+            // Distinguish a user drag from the placement we apply below.
+            // Showing does not wait for the webview's window_ready invoke.
+            let _ = launch_clock();
             if let Some(window) = app.get_webview_window("main") {
-                let save_app = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Moved(pos) = event {
-                        save_window_anchor(&save_app, pos.x as f64, pos.y as f64);
+                        note_user_drag(pos.x as f64, pos.y as f64);
                     }
                 });
             }
-            show_anchored_window(app.handle());
+            present_main_window(app.handle(), true, true);
+            schedule_present(app.handle().clone(), 300);
+            schedule_present(app.handle().clone(), 1200);
+            // Late enough to beat a WINDOWPLACEMENT restore, still shows if
+            // the page never called window_ready. Does not steal focus when
+            // the window is already visible and the user has dragged it.
+            schedule_present(app.handle().clone(), 2500);
 
             // Hit-test polling: only lamps/panels receive mouse events, everything
             // else passes clicks through to windows underneath. Windows hit-testing
@@ -648,8 +802,16 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running AI Traffic Light");
+        .build(tauri::generate_context!())
+        .expect("error while building AI Traffic Light")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Ready) {
+                // setup() already ran inside Ready. Show once more in case
+                // Windows restored a hidden placement while startup finished.
+                let place = main_window_hidden(app) || launch_should_place();
+                present_main_window(app, place, false);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -724,12 +886,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_absolute_position_is_not_an_anchor() {
-        assert!(super::parse_anchor("1200,100").is_none());
-        assert!(super::parse_anchor("16,16").is_none());
-    }
-
-    #[test]
     fn startup_anchor_stays_top_right() {
         let mon = super::MonitorBox {
             x: 0.0,
@@ -745,11 +901,140 @@ mod tests {
     }
 
     #[test]
-    fn anchor_parser_reads_v2() {
-        let anchor = super::parse_anchor("v2,32,18,0,0").unwrap();
-        assert_eq!(anchor.inset_right, 32.0);
-        assert_eq!(anchor.inset_top, 18.0);
-        assert_eq!(anchor.mon_x, Some(0.0));
-        assert_eq!(anchor.mon_y, Some(0.0));
+    fn primary_work_area_top_right_handles_dpi_and_negative_origins() {
+        // Primary 1920×1080, taskbar 40px, 100% DPI, startup window 780×480.
+        let work = super::MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1040.0,
+        };
+        let win = super::WindowBox { w: 780.0, h: 480.0 };
+        assert_eq!(
+            super::top_right_on_work(work, win, 16.0, 1.0),
+            (1124.0, 16.0)
+        );
+
+        // 150% DPI: logical 780×480 is 1170×720 physical, inset 24.
+        let hidpi = super::WindowBox {
+            w: 1170.0,
+            h: 720.0,
+        };
+        assert_eq!(
+            super::top_right_on_work(work, hidpi, 16.0, 1.5),
+            (726.0, 24.0)
+        );
+
+        // Display left of and above the origin. Do not clamp to >= 0.
+        let off = super::MonitorBox {
+            x: -1720.0,
+            y: -2271.0,
+            w: 2560.0,
+            h: 1440.0,
+        };
+        let scaled = super::WindowBox { w: 975.0, h: 600.0 };
+        assert_eq!(
+            super::top_right_on_work(off, scaled, 16.0, 1.25),
+            (-155.0, -2251.0)
+        );
+
+        // Vertical monitor above the origin (840,-1920, 1080×1920).
+        let tall = super::MonitorBox {
+            x: 840.0,
+            y: -1920.0,
+            w: 1080.0,
+            h: 1920.0,
+        };
+        assert_eq!(
+            super::top_right_on_work(tall, win, 16.0, 1.0),
+            (1124.0, -1904.0)
+        );
+    }
+
+    #[test]
+    fn hidden_creation_rect_is_not_the_primary_top_right() {
+        // EnumWindows on the broken launch: vis=false at 156,156 size 1440×753.
+        let work = super::MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let created = super::WindowBox {
+            w: 1440.0,
+            h: 753.0,
+        };
+        let (x, y) = super::top_right_on_work(work, created, 16.0, 1.0);
+        assert_ne!((x, y), (156.0, 156.0));
+        assert!(x > 156.0 && y < 156.0);
+    }
+
+    #[test]
+    fn primary_work_area_wins_over_other_monitors() {
+        let right = (
+            super::MonitorBox {
+                x: 1920.0,
+                y: -831.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            super::MonitorBox {
+                x: 1920.0,
+                y: -831.0,
+                w: 1920.0,
+                h: 1040.0,
+            },
+        );
+        let left = (
+            super::MonitorBox {
+                x: -1720.0,
+                y: -2271.0,
+                w: 2560.0,
+                h: 1440.0,
+            },
+            super::MonitorBox {
+                x: -1720.0,
+                y: -2271.0,
+                w: 2560.0,
+                h: 1440.0,
+            },
+        );
+        let vertical = (
+            super::MonitorBox {
+                x: 840.0,
+                y: -1920.0,
+                w: 1080.0,
+                h: 1920.0,
+            },
+            super::MonitorBox {
+                x: 840.0,
+                y: -1920.0,
+                w: 1080.0,
+                h: 1880.0,
+            },
+        );
+        let primary_full = super::MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let primary_work = super::MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1040.0,
+        };
+        let available = [right, left, vertical, (primary_full, primary_work)];
+        assert_eq!(
+            super::pick_primary_work(Some(primary_work), &available),
+            Some(primary_work)
+        );
+        // primary_monitor() failed: still the display that contains (0, 0),
+        // not whichever monitor was enumerated first.
+        assert_eq!(
+            super::pick_primary_work(None, &available),
+            Some(primary_work)
+        );
     }
 }
