@@ -522,7 +522,242 @@ pub fn init_logging() {
             exe_log_path(),
             temp_log_path()
         ));
+        log_process_token();
     });
+}
+
+#[cfg(windows)]
+fn log_process_token() {
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+    use winapi::um::securitybaseapi::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    };
+    use winapi::um::winnt::{
+        TokenElevation, TokenHasRestrictions, TokenIntegrityLevel, HANDLE,
+        SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID,
+        SECURITY_MANDATORY_MEDIUM_PLUS_RID, SECURITY_MANDATORY_MEDIUM_RID,
+        SECURITY_MANDATORY_SYSTEM_RID, SECURITY_MANDATORY_UNTRUSTED_RID, TOKEN_ELEVATION,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            log_line(&format!("OpenProcessToken failed os={}", GetLastError()));
+            return;
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        let mut integrity = "unknown".to_string();
+        if needed > 0 && needed <= 4096 {
+            let mut buffer = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buffer.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            ) != 0
+            {
+                let label = &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+                let sid = label.Label.Sid;
+                if !sid.is_null() {
+                    let count = *GetSidSubAuthorityCount(sid);
+                    if count > 0 {
+                        let rid = *GetSidSubAuthority(sid, (count - 1) as u32);
+                        let name = if rid == SECURITY_MANDATORY_UNTRUSTED_RID {
+                            "untrusted"
+                        } else if rid == SECURITY_MANDATORY_LOW_RID {
+                            "low"
+                        } else if rid == SECURITY_MANDATORY_MEDIUM_RID {
+                            "medium"
+                        } else if rid == SECURITY_MANDATORY_MEDIUM_PLUS_RID {
+                            "medium-plus"
+                        } else if rid == SECURITY_MANDATORY_HIGH_RID {
+                            "high"
+                        } else if rid == SECURITY_MANDATORY_SYSTEM_RID {
+                            "system"
+                        } else {
+                            "other"
+                        };
+                        integrity = format!("{name} rid={rid:#x}");
+                    }
+                }
+            } else {
+                integrity = format!("query failed os={}", GetLastError());
+            }
+        }
+        let mut elevated = -1i32;
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        ) != 0
+        {
+            elevated = elevation.TokenIsElevated as i32;
+        }
+        let mut restricted = -1i32;
+        let mut flag = 0u32;
+        if GetTokenInformation(
+            token,
+            TokenHasRestrictions,
+            &mut flag as *mut _ as *mut _,
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        ) != 0
+        {
+            restricted = if flag != 0 { 1 } else { 0 };
+        }
+        CloseHandle(token);
+        log_line(&format!(
+            "token integrity={integrity} elevated={elevated} restricted={restricted}"
+        ));
+    }
+}
+
+#[cfg(not(windows))]
+fn log_process_token() {
+    log_line("token integrity skipped");
+}
+
+static ERROR_BOX_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn show_error_box(message: &str) {
+    log_line(&format!("MessageBox: {message}"));
+    #[cfg(windows)]
+    {
+        if ERROR_BOX_SHOWN.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST};
+        let mut text: Vec<u16> = std::ffi::OsStr::new(message)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let title: Vec<u16> = std::ffi::OsStr::new("AI Traffic Light")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_mut_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+}
+
+fn probe_writable(path: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| format!("create_dir_all: {error}"))?;
+    let probe = path.join(".write-probe");
+    std::fs::write(&probe, b"ok").map_err(|error| format!("write: {error}"))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+fn webview_data_dir() -> Result<PathBuf, String> {
+    static CHOSEN: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    CHOSEN.get_or_init(choose_webview_data_dir).clone()
+}
+
+fn choose_webview_data_dir() -> Result<PathBuf, String> {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        if !local.is_empty() {
+            let default_dir = PathBuf::from(local).join("com.pcj1997.ai-traffic-light");
+            match probe_writable(&default_dir) {
+                Ok(()) => log_line(&format!(
+                    "default WebView2 dir writable {}",
+                    default_dir.display()
+                )),
+                Err(error) => log_line(&format!(
+                    "default WebView2 dir not writable {} ({error})",
+                    default_dir.display()
+                )),
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("webview-data")))
+    {
+        candidates.push(dir);
+    }
+    if let Some(temp) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
+        if !temp.is_empty() {
+            candidates.push(PathBuf::from(temp).join("ai-traffic-light-webview"));
+        }
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        if !profile.is_empty() {
+            candidates.push(
+                PathBuf::from(profile)
+                    .join("AppData")
+                    .join("LocalLow")
+                    .join("ai-traffic-light-webview"),
+            );
+        }
+    }
+    let mut failures = Vec::new();
+    for path in candidates {
+        match probe_writable(&path) {
+            Ok(()) => {
+                log_line(&format!("webview data directory {}", path.display()));
+                return Ok(path);
+            }
+            Err(error) => {
+                log_line(&format!(
+                    "webview data dir rejected {} ({error})",
+                    path.display()
+                ));
+                failures.push(format!("{} ({error})", path.display()));
+            }
+        }
+    }
+    Err(format!(
+        "no writable WebView2 data directory: {}",
+        failures.join("; ")
+    ))
+}
+
+fn build_failure(stage: &str, error: &dyn std::fmt::Display) -> String {
+    format!("{stage}: WebviewWindowBuilder::build failed: {error}")
+}
+
+fn confirm_webview(window: &tauri::WebviewWindow, stage: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    match window.hwnd() {
+        Ok(hwnd) => log_line(&format!("{stage} hwnd {:?}", hwnd.0)),
+        Err(error) => {
+            return Err(format!(
+                "{stage}: hwnd unavailable immediately after build: {error}"
+            ));
+        }
+    }
+    match window.is_visible() {
+        Ok(visible) => log_line(&format!("{stage} is_visible={visible}")),
+        Err(error) => {
+            return Err(format!(
+                "{stage}: webview did not start (failed to receive message): {error}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn place_primary_top_right(
@@ -623,14 +858,24 @@ fn open_configured_window(app: &AppHandle) -> Result<tauri::WebviewWindow, Strin
         config.x,
         config.y
     ));
-    log_line("from_config build begin");
-    let window = tauri::WebviewWindowBuilder::from_config(app, &config)
-        .map_err(|error| error.to_string())?
+    let data_dir = webview_data_dir()?;
+    log_line(&format!(
+        "from_config build begin data_directory={}",
+        data_dir.display()
+    ));
+    let built = tauri::WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|error| build_failure("from_config", &error))?
+        .data_directory(data_dir)
         .visible(true)
         .build()
-        .map_err(|error| error.to_string())?;
-    log_line("from_config build returned");
-    Ok(window)
+        .map_err(|error| build_failure("from_config", &error))?;
+    log_line("from_config build returned Ok");
+    if let Err(error) = confirm_webview(&built, "from_config") {
+        log_line(&format!("from_config destroy broken window: {error}"));
+        let _ = built.destroy();
+        return Err(error);
+    }
+    Ok(built)
 }
 
 #[cfg(windows)]
@@ -701,38 +946,64 @@ fn log_top_level_windows(stage: &str) {
 }
 
 fn open_fallback_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-    log_line("creating fallback WebviewWindowBuilder");
-    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-        .title("AI Traffic Light")
-        .inner_size(START_LOGICAL_W, START_LOGICAL_H)
-        .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .resizable(false)
-        .skip_taskbar(true)
-        .shadow(false)
-        .visible(true)
-        .focused(true)
-        .build()
-        .map_err(|error| error.to_string())
+    let data_dir = webview_data_dir()?;
+    log_line(&format!(
+        "fallback build begin data_directory={}",
+        data_dir.display()
+    ));
+    let built =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            .title("AI Traffic Light")
+            .inner_size(START_LOGICAL_W, START_LOGICAL_H)
+            .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .resizable(false)
+            .skip_taskbar(true)
+            .shadow(false)
+            .visible(true)
+            .focused(true)
+            .data_directory(data_dir)
+            .build()
+            .map_err(|error| build_failure("fallback", &error))?;
+    log_line("fallback build returned Ok");
+    if let Err(error) = confirm_webview(&built, "fallback") {
+        log_line(&format!("fallback destroy broken window: {error}"));
+        let _ = built.destroy();
+        return Err(error);
+    }
+    Ok(built)
 }
 
 fn open_plain_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-    log_line("creating plain (non-transparent) window");
-    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-        .title("AI Traffic Light")
-        .inner_size(START_LOGICAL_W, START_LOGICAL_H)
-        .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
-        .decorations(true)
-        .transparent(false)
-        .always_on_top(true)
-        .resizable(true)
-        .skip_taskbar(false)
-        .visible(true)
-        .focused(true)
-        .build()
-        .map_err(|error| error.to_string())
+    let data_dir = webview_data_dir()?;
+    log_line(&format!(
+        "plain build begin data_directory={}",
+        data_dir.display()
+    ));
+    let built =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            .title("AI Traffic Light")
+            .inner_size(START_LOGICAL_W, START_LOGICAL_H)
+            .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
+            .decorations(true)
+            .transparent(false)
+            .always_on_top(true)
+            .resizable(true)
+            .skip_taskbar(false)
+            .visible(true)
+            .focused(true)
+            .data_directory(data_dir)
+            .build()
+            .map_err(|error| build_failure("plain", &error))?;
+    log_line("plain build returned Ok");
+    if let Err(error) = confirm_webview(&built, "plain") {
+        log_line(&format!("plain destroy broken window: {error}"));
+        let _ = built.destroy();
+        return Err(error);
+    }
+    Ok(built)
 }
 
 fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
@@ -783,11 +1054,14 @@ fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
         }
         Ok(Err(error)) => {
             log_line(&format!("plain window failed: {error}"));
+            show_error_box(&format!("主窗口创建失败。\n{error}"));
             Err(error)
         }
         Err(_) => {
             log_line("plain window panicked");
-            Err("plain window panicked".to_string())
+            let error = "plain window panicked".to_string();
+            show_error_box(&format!("主窗口创建失败。\n{error}"));
+            Err(error)
         }
     }
 }
