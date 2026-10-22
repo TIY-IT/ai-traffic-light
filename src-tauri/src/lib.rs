@@ -74,9 +74,9 @@ fn focus_session(client: String, id: String) -> Result<(), String> {
 // Gap between the window and the primary work area's top-right, in logical px.
 // Launch multiplies this by that monitor's own scale factor (physical px).
 const DEFAULT_INSET: f64 = 16.0;
-const MIN_LOGICAL_W: f64 = 240.0;
+const MIN_LOGICAL_W: f64 = 72.0;
 const MAX_LOGICAL_W: f64 = 1400.0;
-const MIN_LOGICAL_H: f64 = 168.0;
+const MIN_LOGICAL_H: f64 = 120.0;
 const MAX_LOGICAL_H: f64 = 980.0;
 const START_LOGICAL_W: f64 = 780.0;
 const START_LOGICAL_H: f64 = 480.0;
@@ -294,6 +294,10 @@ static USER_DRAGGED: AtomicBool = AtomicBool::new(false);
 static LAUNCH_AT: OnceLock<Instant> = OnceLock::new();
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static REBUILDS: AtomicU8 = AtomicU8::new(0);
+// Set when no client is running or freshly stopped. Startup presents must not
+// undo that hide. Tray "显示悬浮灯" clears it and sets FORCE_VISIBLE.
+static PRESENCE_HIDDEN: AtomicBool = AtomicBool::new(false);
+static FORCE_VISIBLE: AtomicBool = AtomicBool::new(false);
 static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn launch_clock() -> Instant {
@@ -1089,7 +1093,17 @@ fn log_window_state(window: &tauri::WebviewWindow, stage: &str) {
 /// the parent only; child WebView2 HWNDs are left alone because showing them
 /// during startup re-enters the controller and can destroy the parent.
 /// The frontend `window_ready` invoke is not a gate.
-fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool, native: bool) {
+fn present_main_window(
+    app: &AppHandle,
+    place: bool,
+    reset_to_start: bool,
+    native: bool,
+    focus: bool,
+) {
+    if PRESENCE_HIDDEN.load(Ordering::Relaxed) && !FORCE_VISIBLE.load(Ordering::Relaxed) {
+        log_line("present skipped: no client in use");
+        return;
+    }
     if app.get_webview_window("main").is_none() {
         if let Err(error) = ensure_main_window(app) {
             log_line(&format!("present aborted: {error}"));
@@ -1100,7 +1114,7 @@ fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool, nativ
         log_line("present aborted: main still missing");
         return;
     };
-    let needs_focus = place || window.is_visible().ok() != Some(true);
+    let needs_focus = focus && (place || window.is_visible().ok() != Some(true));
     let placed = if place {
         place_primary_top_right(&window, reset_to_start)
     } else {
@@ -1148,10 +1162,14 @@ fn schedule_present(app: AppHandle, delay_ms: u64) {
             .run_on_main_thread(move || {
                 log_line("deferred present");
                 let place = main_window_hidden(&for_task) || launch_should_place();
-                present_main_window(&for_task, place, false, true);
+                present_main_window(&for_task, place, false, true, true);
             })
             .is_err()
         {
+            if PRESENCE_HIDDEN.load(Ordering::Relaxed) && !FORCE_VISIBLE.load(Ordering::Relaxed) {
+                log_line("deferred present skipped: no client in use");
+                return;
+            }
             log_line("run_on_main_thread failed; showing without native call");
             let _ = queued.get_webview_window("main").map(|window| {
                 let _ = window.unminimize();
@@ -1176,7 +1194,14 @@ fn schedule_recreate(app: AppHandle) {
         let _ = app.run_on_main_thread(move || {
             log_line("recreate main after destroy");
             let _ = ensure_main_window(&queued);
-            present_main_window(&queued, true, true, true);
+            if PRESENCE_HIDDEN.load(Ordering::Relaxed) && !FORCE_VISIBLE.load(Ordering::Relaxed) {
+                log_line("recreate kept hidden: no client in use");
+                if let Some(window) = queued.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                return;
+            }
+            present_main_window(&queued, true, true, true, true);
         });
     });
 }
@@ -1364,9 +1389,79 @@ fn tray_icon(state: &str) -> Image<'static> {
     Image::new_owned(rgba, size, size)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LampVisibility {
+    Show,
+    Hide,
+    Leave,
+}
+
+/// Running or freshly stopped clients show the window. With none, hide it
+/// unless the tray asked to keep it on screen. Repeating the same state does
+/// not move a window the user can already see.
+fn lamp_visibility(active: bool, forced: bool, window_hidden: bool) -> LampVisibility {
+    if active {
+        if window_hidden {
+            LampVisibility::Show
+        } else {
+            LampVisibility::Leave
+        }
+    } else if forced || window_hidden {
+        LampVisibility::Leave
+    } else {
+        LampVisibility::Hide
+    }
+}
+
+fn apply_lamp_presence(app: &AppHandle, active: bool) {
+    let forced = FORCE_VISIBLE.load(Ordering::Relaxed);
+    let window_hidden = PRESENCE_HIDDEN.load(Ordering::Relaxed) || main_window_hidden(app);
+    match lamp_visibility(active, forced, window_hidden) {
+        LampVisibility::Show => {
+            FORCE_VISIBLE.store(false, Ordering::Relaxed);
+            PRESENCE_HIDDEN.store(false, Ordering::Relaxed);
+            log_line("show: a client is in use");
+            present_main_window(app, true, false, true, false);
+        }
+        LampVisibility::Hide => {
+            PRESENCE_HIDDEN.store(true, Ordering::Relaxed);
+            log_line("hide: no client in use");
+            if let Some(window) = app.get_webview_window("main") {
+                match window.hide() {
+                    Ok(()) => log_line("hide ok"),
+                    Err(error) => log_line(&format!("hide error: {error}")),
+                }
+            }
+        }
+        LampVisibility::Leave => {
+            if active {
+                FORCE_VISIBLE.store(false, Ordering::Relaxed);
+                PRESENCE_HIDDEN.store(false, Ordering::Relaxed);
+            } else if !forced {
+                PRESENCE_HIDDEN.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn set_lamp_presence(app: AppHandle, active: bool) {
+    let queued = app.clone();
+    if app
+        .run_on_main_thread(move || apply_lamp_presence(&queued, active))
+        .is_err()
+    {
+        log_line("set_lamp_presence: main thread unavailable");
+        apply_lamp_presence(&app, active);
+    }
+}
+
 fn show_window(app: &AppHandle) {
+    FORCE_VISIBLE.store(true, Ordering::Relaxed);
+    PRESENCE_HIDDEN.store(false, Ordering::Relaxed);
+    log_line("show from tray");
     let place = main_window_hidden(app) || launch_should_place();
-    present_main_window(app, place, false, true);
+    present_main_window(app, place, false, true, true);
 }
 
 // Page load is not required. If this never arrives (missing dist, custom
@@ -1377,10 +1472,14 @@ fn window_ready(app: AppHandle) {
     if app
         .run_on_main_thread(move || {
             let place = main_window_hidden(&queued) || launch_should_place();
-            present_main_window(&queued, place, false, true);
+            present_main_window(&queued, place, false, true, true);
         })
         .is_err()
     {
+        if PRESENCE_HIDDEN.load(Ordering::Relaxed) && !FORCE_VISIBLE.load(Ordering::Relaxed) {
+            log_line("window_ready skipped: no client in use");
+            return;
+        }
         let _ = app.get_webview_window("main").map(|window| {
             let _ = window.unminimize();
             let _ = window.show();
@@ -1419,10 +1518,12 @@ pub fn run() {
         // process, which is why "setup begin" can be missing from that process.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             log_line("single-instance callback");
+            FORCE_VISIBLE.store(true, Ordering::Relaxed);
+            PRESENCE_HIDDEN.store(false, Ordering::Relaxed);
             let queued = app.clone();
             let _ = app.run_on_main_thread(move || {
                 let place = main_window_hidden(&queued) || launch_should_place();
-                present_main_window(&queued, place, false, true);
+                present_main_window(&queued, place, false, true, true);
             });
         }));
     log_line("plugin register: notification");
@@ -1437,6 +1538,7 @@ pub fn run() {
             get_status,
             session_user_prompts,
             resize_light_to_fit,
+            set_lamp_presence,
             window_ready,
             set_hit_regions,
             notify_enabled,
@@ -1502,7 +1604,7 @@ pub fn run() {
             }
             // Tauri show only. Native ShowWindow is deferred so it does not
             // re-enter WebView2 while the controller is still starting.
-            present_main_window(app.handle(), true, true, false);
+            present_main_window(app.handle(), true, true, false, true);
             schedule_present(app.handle().clone(), 100);
             schedule_present(app.handle().clone(), 300);
             schedule_present(app.handle().clone(), 1200);
@@ -1682,7 +1784,7 @@ pub fn run() {
                 tauri::RunEvent::Ready => {
                     log_line("RunEvent::Ready");
                     let place = main_window_hidden(app) || launch_should_place();
-                    present_main_window(app, place, false, false);
+                    present_main_window(app, place, false, false, true);
                 }
                 tauri::RunEvent::ExitRequested { code, api, .. } => {
                     log_line(&format!("ExitRequested code={code:?}"));
@@ -1764,10 +1866,22 @@ mod tests {
         assert_eq!(fitted, (720.0, 420.0));
         let wide = super::fit_logical_size(1100.0, 800.0).unwrap();
         assert_eq!(wide, (1100.0, 800.0));
-        assert!(fitted.0 >= 240.0 && fitted.1 >= 168.0);
+        assert!(fitted.0 >= 72.0 && fitted.1 >= 120.0);
         assert!(super::fit_logical_size(f64::NAN, 400.0).is_none());
         let tiny = super::fit_logical_size(16.0, 16.0).unwrap();
-        assert!(tiny.0 >= 240.0 && tiny.1 >= 168.0);
+        assert!(tiny.0 >= 72.0 && tiny.1 >= 120.0);
+        let one_lamp = super::fit_logical_size(84.0, 160.0).unwrap();
+        assert_eq!(one_lamp, (84.0, 160.0));
+    }
+
+    #[test]
+    fn lamp_shows_only_while_a_client_is_in_use() {
+        use super::LampVisibility::{Hide, Leave, Show};
+        assert_eq!(super::lamp_visibility(true, false, true), Show);
+        assert_eq!(super::lamp_visibility(true, true, false), Leave);
+        assert_eq!(super::lamp_visibility(false, false, false), Hide);
+        assert_eq!(super::lamp_visibility(false, true, false), Leave);
+        assert_eq!(super::lamp_visibility(false, false, true), Leave);
     }
 
     #[test]

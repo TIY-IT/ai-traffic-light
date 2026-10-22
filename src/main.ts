@@ -177,7 +177,7 @@ function publishHitRegions() {
 function render(snapshot: StatusSnapshot) {
   snapshot.session_count = snapshot.sessions.length;
 
-  // 灯常亮:运行中绿灯,有已停会话就红灯。超过 15 分钟也不熄灭,窗口不随运行状态隐藏。
+  // 灯只在使用中出现:运行中绿灯,15 分钟内刚停红灯。更早的已停和暂无状态不渲染。
   const nowSecs = Date.now() / 1000;
   const isEnded = (s: SessionSnapshot) => ENDED_STATES.includes(s.state);
   const isFresh = (s: SessionSnapshot) =>
@@ -203,13 +203,13 @@ function render(snapshot: StatusSnapshot) {
   }
 
   for (const housing of housings) {
-    housing.hidden = false;
     const sessions = snapshot.sessions.filter(s => s.client === housing.dataset.client);
     const running = sessions.filter((s) => s.state === "working").length;
     const freshStopped = sessions.filter(isFresh).length;
-    const stopped = sessions.filter(isEnded).length;
-    // 绿灯 = 有会话在跑;红灯 = 没有在跑但有已停会话。没有会话时灯壳仍留在桌面上。
-    const colorState = running ? "completed" : stopped > 0 ? "waiting" : "idle";
+    const showLamp = running > 0 || freshStopped > 0;
+    housing.hidden = !showLamp;
+    if (!showLamp) continue;
+    const colorState = running ? "completed" : "waiting";
     housing.querySelectorAll<HTMLElement>(".light").forEach(light => {
       light.classList.toggle("active", light.dataset.state === colorState);
     });
@@ -217,9 +217,7 @@ function render(snapshot: StatusSnapshot) {
     if (label) {
       label.textContent = running
         ? `${running} 运行${freshStopped ? ` · ${freshStopped} 新停` : ""}`
-        : stopped > 0
-          ? `已停 ${stopped}`
-          : "暂无状态";
+        : `刚结束 ${freshStopped}`;
     }
     housing.setAttribute("aria-label", `${clientLabel(housing.dataset.client || "")}：${label?.textContent}`);
     if (justEndedClients.has(housing.dataset.client || "")) flashAttn(housing);
@@ -331,12 +329,7 @@ function render(snapshot: StatusSnapshot) {
             return item;
           });
 
-        if (sessions.length === 0) {
-          const empty = document.createElement("li");
-          empty.className = "session-empty";
-          empty.textContent = "暂无会话";
-          return [groupTitle, empty];
-        }
+        if (sessions.length === 0) return [];
         return [groupTitle, ...sessions];
       }),
     );
@@ -355,6 +348,17 @@ function render(snapshot: StatusSnapshot) {
   if (justEndedClients.size > 0) void playDing();
   fitWindowToWidget();
   publishHitRegions();
+  syncLampPresence(housings.some((housing) => !housing.hidden));
+}
+
+let lampPresence: boolean | null = null;
+
+function syncLampPresence(active: boolean) {
+  if (lampPresence === active) return;
+  lampPresence = active;
+  invoke("set_lamp_presence", { active }).catch(() => {
+    if (lampPresence === active) lampPresence = null;
+  });
 }
 
 function fitWindowToWidget() {
@@ -363,7 +367,7 @@ function fitWindowToWidget() {
   const rect = widget.getBoundingClientRect();
   const width = Math.ceil(rect.width) + 12;
   const height = Math.ceil(rect.height) + 12;
-  if (width >= 80 && height >= 80) {
+  if (width >= 48 && height >= 48) {
     invoke("resize_light_to_fit", { width, height }).catch(() => {});
   }
 }
