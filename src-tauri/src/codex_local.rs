@@ -373,12 +373,7 @@ fn extract_user_text(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-struct PromptHit {
-    preferred: bool,
-    text: String,
-}
-
-fn prompt_from_line(line: &str) -> Option<PromptHit> {
+fn prompt_from_line(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -391,12 +386,15 @@ fn prompt_from_line(line: &str) -> Option<PromptHit> {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let preferred = classify_user_event(&value)?;
-    let text = clean_user_text(&extract_user_text(&value)?)?;
-    Some(PromptHit { preferred, text })
+    // Both user_message and response_item are candidates. File order decides
+    // which one is shown; injected blocks are removed inside clean_user_text.
+    classify_user_event(&value)?;
+    clean_user_text(&extract_user_text(&value)?)
 }
 
 fn push_prompt(bucket: &mut Vec<String>, text: String) {
+    // Collapse only the copy Codex writes twice in a row. The same words typed
+    // again after another prompt stay, in their original place.
     if bucket.last() == Some(&text) {
         return;
     }
@@ -406,39 +404,14 @@ fn push_prompt(bucket: &mut Vec<String>, text: String) {
     }
 }
 
-fn merge_prompts(preferred: Vec<String>, fallback: Vec<String>) -> Vec<String> {
-    if preferred.is_empty() {
-        return fallback;
-    }
-    let mut out = preferred;
-    for text in fallback {
-        if out.len() >= MAX_PROMPTS {
-            break;
-        }
-        if out.iter().any(|item| item == &text) {
-            continue;
-        }
-        out.push(text);
-    }
-    out
-}
-
 fn prompts_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut preferred = Vec::new();
-    let mut fallback = Vec::new();
+    let mut kept = Vec::new();
     for line in lines {
-        if let Some(hit) = prompt_from_line(line) {
-            push_prompt(
-                if hit.preferred {
-                    &mut preferred
-                } else {
-                    &mut fallback
-                },
-                hit.text,
-            );
+        if let Some(text) = prompt_from_line(line) {
+            push_prompt(&mut kept, text);
         }
     }
-    merge_prompts(preferred, fallback)
+    kept
 }
 
 fn session_title(sqlite_title: &str, rollout: &Path) -> String {
@@ -448,24 +421,18 @@ fn session_title(sqlite_title: &str, rollout: &Path) -> String {
 fn first_real_prompt_in_file(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
-    let mut fallback = None;
     let mut scanned = 0usize;
     for line in reader.lines() {
         let line = line.ok()?;
         scanned = scanned.saturating_add(line.len());
-        if let Some(hit) = prompt_from_line(&line) {
-            if hit.preferred {
-                return Some(hit.text);
-            }
-            if fallback.is_none() {
-                fallback = Some(hit.text);
-            }
+        if let Some(text) = prompt_from_line(&line) {
+            return Some(text);
         }
         if scanned > 8 * 1024 * 1024 {
             break;
         }
     }
-    fallback
+    None
 }
 
 #[cfg(test)]
@@ -562,22 +529,14 @@ fn resolve_rollout(root: &Path, thread_id: &str) -> Result<Option<PathBuf>, Stri
 fn read_prompts_file(path: &Path) -> Result<Vec<String>, String> {
     let file = File::open(path).map_err(|err| format!("读取会话日志失败：{err}"))?;
     let reader = BufReader::new(file);
-    let mut preferred = Vec::new();
-    let mut fallback = Vec::new();
+    let mut kept = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("读取会话日志失败：{err}"))?;
-        if let Some(hit) = prompt_from_line(&line) {
-            push_prompt(
-                if hit.preferred {
-                    &mut preferred
-                } else {
-                    &mut fallback
-                },
-                hit.text,
-            );
+        if let Some(text) = prompt_from_line(&line) {
+            push_prompt(&mut kept, text);
         }
     }
-    Ok(merge_prompts(preferred, fallback))
+    Ok(kept)
 }
 
 fn user_prompts_in(root: &Path, session_id: &str) -> Result<Vec<String>, String> {
@@ -671,6 +630,19 @@ pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
   assert_eq!(
    parse_user_prompts(text),
    vec!["帮我看会话列表".to_string(), "第二条提问".to_string(), "第三条提问".to_string(), "同样的话".to_string()]
+  );
+ }
+ #[test]
+ fn user_prompts_keep_file_order_and_later_repeats() {
+  let text = r#"
+{"type":"event_msg","payload":{"type":"user_message","message":"你好"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"中间还有一句"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"你好"}}
+"#;
+  assert_eq!(
+   parse_user_prompts(text),
+   vec!["你好".to_string(), "中间还有一句".to_string(), "你好".to_string()]
   );
  }
  #[test]
