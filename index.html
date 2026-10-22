@@ -6,9 +6,9 @@
     <title>AI Traffic Light</title>
   </head>
   <body data-state="idle">
-    <main class="widget">
+    <main class="widget" data-panel-open="true">
       <div class="lamps" data-tauri-drag-region>
-      <section class="housing" data-client="codex" data-tauri-drag-region>
+      <section class="housing" hidden data-client="codex" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div
           class="light light-red"
@@ -23,42 +23,42 @@
         <div class="client-name" data-tauri-drag-region>Codex</div>
         <div class="client-status" data-tauri-drag-region>未知</div>
       </section>
-      <section class="housing" data-client="workbuddy" data-tauri-drag-region>
+      <section class="housing" hidden data-client="workbuddy" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
         <div class="client-name" data-tauri-drag-region>WorkBuddy</div>
         <div class="client-status" data-tauri-drag-region>未知</div>
       </section>
-      <section class="housing" data-client="marvis" data-tauri-drag-region>
+      <section class="housing" hidden data-client="marvis" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
         <div class="client-name" data-tauri-drag-region>Marvis</div>
         <div class="client-status" data-tauri-drag-region>暂无状态</div>
       </section>
-      <section class="housing" data-client="zcode" data-tauri-drag-region>
+      <section class="housing" hidden data-client="zcode" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
         <div class="client-name" data-tauri-drag-region>ZCode</div>
         <div class="client-status" data-tauri-drag-region>暂无状态</div>
       </section>
-      <section class="housing" data-client="coze" data-tauri-drag-region>
+      <section class="housing" hidden data-client="coze" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
         <div class="client-name" data-tauri-drag-region>扣子</div>
         <div class="client-status" data-tauri-drag-region>暂无状态</div>
       </section>
-      <section class="housing" data-client="trae" data-tauri-drag-region>
+      <section class="housing" hidden data-client="trae" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
         <div class="client-name" data-tauri-drag-region>TRAE</div>
         <div class="client-status" data-tauri-drag-region>暂无状态</div>
       </section>
-      <section class="housing" data-client="doubao" data-tauri-drag-region>
+      <section class="housing" hidden data-client="doubao" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>AI</div>
         <div class="light light-red" data-state="waiting" data-tauri-drag-region></div>
         <div class="light light-green" data-state="completed" data-tauri-drag-region></div>
@@ -77,6 +77,14 @@
             <span id="session-count">暂无会话记录</span>
             <span id="fresh-chip" hidden>刚结束 1</span>
           </div>
+          <input
+            id="session-search"
+            class="session-search"
+            type="search"
+            placeholder="搜索会话或提问"
+            spellcheck="false"
+            aria-label="搜索会话或提问"
+          />
           <ul id="session-list" class="session-list"></ul>
           <button id="clear-sessions" class="clear-sessions" type="button" hidden>
             清空已停

@@ -119,8 +119,10 @@ fn send(app: &AppHandle, session: &SessionSnapshot) {
 /// 每 500ms 比对一帧;开关关闭时只跟进状态基准、不发通知,避免重新开启后
 /// 为关闭期间早已结束的会话补发轰炸。
 pub fn start(app: AppHandle) {
-    ENABLED.store(load_notify_enabled(), Ordering::Relaxed);
     std::thread::spawn(move || {
+        // Config lives under the user profile. A redirected home directory must
+        // not block the UI thread that creates the window.
+        ENABLED.store(load_notify_enabled(), Ordering::Relaxed);
         let mut prev: HashMap<String, String> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut last_notified: HashMap<String, std::time::Instant> = HashMap::new();

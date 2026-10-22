@@ -28,7 +28,7 @@ body {
 
 .widget {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 8px;
 }
@@ -154,8 +154,10 @@ body[data-state="idle"] .light-green {
 
 .panel-stack {
   display: none;
-  width: 190px;
+  width: max-content;
+  max-width: 760px;
   max-height: calc(100vh - 16px);
+  align-self: flex-start;
   flex-direction: column;
   gap: 8px;
 }
@@ -168,12 +170,13 @@ body[data-state="idle"] .light-green {
 .panel-header { display: flex; align-items: center; gap: 4px; }
 .panel-header strong { flex: 1; min-width: 0; }
 #close-panel { flex: 0 0 24px; width: 24px; height: 24px; padding: 0; font-size: 21px; line-height: 20px; }
-.details-toggle { display: block; width: 100%; padding: 0; height: 12px; line-height: 12px; border: 0; background: transparent; color: #bbc3cf; font-size: 12px; }
+.details-toggle { display: block; width: 100%; padding: 0; height: 18px; line-height: 18px; border: 0; background: transparent; color: #bbc3cf; font-size: 14px; cursor: pointer; }
 .details-toggle:focus-visible, #close-panel:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
 
 .panel {
   display: flex;
-  width: 190px;
+  width: 440px;
+  max-width: 760px;
   min-height: 0;
   padding: 11px;
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -185,6 +188,12 @@ body[data-state="idle"] .light-green {
 
 .panel-stack > .panel:not(.hooks-warning):not(.team-panel) {
   flex: 1 1 auto;
+  height: 520px;
+  min-width: 320px;
+  min-height: 300px;
+  max-height: 780px;
+  overflow: hidden;
+  resize: both;
 }
 
 #open-team {
@@ -218,10 +227,30 @@ body[data-state="idle"] .light-green {
   white-space: nowrap;
 }
 
+.session-search {
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  color: #f5f7fa;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.session-search::placeholder {
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.session-search:focus {
+  outline: 2px solid rgba(147, 197, 253, 0.7);
+  outline-offset: 1px;
+}
+
 .session-list {
   display: flex;
   min-height: 0;
-  max-height: 132px;
   margin: 2px 0 0;
   padding: 0;
   flex: 1 1 auto;
@@ -267,13 +296,159 @@ body[data-state="idle"] .light-green {
 
 .session-item {
   display: flex;
-  align-items: center;
-  gap: 5px;
+  flex-direction: column;
   min-width: 0;
-  padding: 3px 6px;
+  padding: 0;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.06);
   cursor: pointer;
+}
+
+.session-item.is-selected {
+  background: rgba(147, 197, 253, 0.12);
+  outline: 1px solid rgba(147, 197, 253, 0.45);
+}
+
+.session-item.is-selected .session-row {
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.session-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+  padding: 6px 6px 4px;
+  cursor: pointer;
+}
+
+.session-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 0 8px 8px 18px;
+}
+
+.session-summary {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.session-summary.is-pending {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.copy-prompts {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.copy-prompts:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.session-empty {
+  padding: 2px 6px 4px;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 10px;
+  list-style: none;
+}
+
+.prompt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 8px 10px;
+}
+
+.prompt-note,
+.prompt-error {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.prompt-error {
+  color: #f87171;
+}
+
+.prompt-card {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  cursor: pointer;
+}
+
+.prompt-card.is-open {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.prompt-time {
+  margin-bottom: 4px;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.prompt-body {
+  display: -webkit-box;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.prompt-card.is-open .prompt-body {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.prompt-link {
+  color: #93c5fd;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prompt-more {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  border-radius: 999px;
+  color: #dbeafe;
+  background: rgba(147, 197, 253, 0.12);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.prompt-more:hover {
+  background: rgba(147, 197, 253, 0.22);
 }
 
 .session-item:hover {
@@ -284,6 +459,7 @@ body[data-state="idle"] .light-green {
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
+  margin-top: 4px;
   border-radius: 50%;
   background: #6b7280;
 }
@@ -301,37 +477,45 @@ body[data-state="idle"] .light-green {
   background: #ef4444;
 }
 
-/* 单行会话行:状态点 + 标题(ellipsis) + 右侧状态小字,badge 不再是胶囊。 */
 .session-state-badge {
   flex-shrink: 0;
-  max-width: 46px;
+  margin-top: 1px;
   margin-left: auto;
-  overflow: hidden;
-  background: none;
-  color: #8fa0b3;
-  font-size: 8px;
-  line-height: 1.3;
-  text-overflow: ellipsis;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #d5dde6;
+  font-size: 12px;
+  line-height: 1.4;
   white-space: nowrap;
 }
 
 .session-working .session-state-badge {
-  color: #4ade80;
+  color: #bbf7d0;
+  background: rgba(34, 197, 94, 0.18);
+}
+
+.session-completed .session-state-badge,
+.session-waiting .session-state-badge,
+.session-error .session-state-badge {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.16);
 }
 
 .session-heading {
-  display: flex;
+  display: block;
   min-width: 0;
   flex: 1;
-  align-items: center;
 }
 
 .session-heading strong {
+  display: block;
   min-width: 0;
-  overflow: hidden;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .session-remove {

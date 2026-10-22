@@ -14,12 +14,13 @@
     "windows": [
       {
         "label": "main",
-        "visible": false,
+        "create": false,
+        "visible": true,
         "title": "AI Traffic Light",
-        "width": 566,
-        "height": 226,
-        "minWidth": 80,
-        "minHeight": 226,
+        "width": 780,
+        "height": 480,
+        "minWidth": 72,
+        "minHeight": 120,
         "x": 100,
         "y": 100,
         "decorations": false,
