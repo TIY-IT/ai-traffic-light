@@ -66,7 +66,7 @@ fn read(home:&Path)->Result<Vec<SessionSnapshot>,Box<dyn std::error::Error>>{
   let life=read_lifecycle(Path::new(&path)).unwrap_or(Lifecycle{state:"idle",turn:String::new(),started:String::new()});
   let started:Option<i64>=db.query_row("SELECT unixepoch(?1)",[&life.started],|r|r.get(0))?;
   let state=if life.state=="working"&&now.saturating_sub(updated)>1800{"idle"}else{life.state};
-  let title=session_title(&title,Path::new(&path));
+  let Some(title)=session_title(&title,Path::new(&path)).or_else(|| parent.is_some().then(|| fallback_title(&title))) else { continue; };
   rows.push(Row{id,title,parent,state,updated,started:started.map(|v|v.max(0) as u64).unwrap_or(0)});
  }
  Ok(aggregate(&rows,now))
@@ -200,43 +200,37 @@ fn classify_user_event(value: &serde_json::Value) -> Option<bool> {
     None
 }
 
-fn is_injected_tag(tag: &str) -> bool {
-    matches!(
-        tag,
-        "environment_context"
-            | "user_instructions"
-            | "INSTRUCTIONS"
-            | "turn_aborted"
-            | "skill"
-            | "skills"
-            | "attachment"
-            | "attachments"
-            | "image"
-            | "images"
-            | "agent_skill"
-            | "agent_skills"
-            | "skill_instructions"
-            | "user_info"
-            | "additional_data"
-    ) || tag.starts_with("permissions")
+fn is_system_tag(name: &str) -> bool {
+    if name.contains('_') || name.contains('-') {
+        return true;
+    }
+    if name.len() >= 2 && name.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("permission")
+        || matches!(
+            lower.as_str(),
+            "skill" | "skills" | "image" | "images" | "attachment" | "attachments"
+        )
+}
+
+/// Leading `<tag ...>` is always a wrapper. Embedded blocks are removed when the
+/// tag is snake_case, shouty, or one of the short Codex wrappers.
+fn is_wrapper_tag(name: &str, leading: bool) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && (leading || is_system_tag(name))
 }
 
 fn starts_injected(text: &str) -> bool {
     let text = text.trim_start();
-    text.starts_with("# AGENTS.md instructions")
-        || text.starts_with("<environment_context>")
-        || text.starts_with("<environment_context ")
-        || text.starts_with("<user_instructions>")
-        || text.starts_with("<user_instructions ")
-        || text.starts_with("<INSTRUCTIONS>")
-        || text.starts_with("<INSTRUCTIONS ")
-        || text.starts_with("<permissions")
-        || text.starts_with("<turn_aborted>")
-        || text.starts_with("<turn_aborted ")
-        || text.starts_with("<turn_aborted/>")
-        || text.starts_with("<skill")
-        || text.starts_with("<attachment")
-        || text.starts_with("<image")
+    text.starts_with("# AGENTS.md instructions") || parse_open_tag(text).is_some()
 }
 
 fn is_image_placeholder(line: &str) -> bool {
@@ -250,9 +244,9 @@ fn is_image_placeholder(line: &str) -> bool {
         || lower.starts_with("![")
 }
 
-/// Byte length of an injected open tag at the start of `text`, its name, and
-/// whether it is self-closing. `None` when the `<` is not one of those tags.
-fn parse_injected_open(text: &str) -> Option<(usize, String, bool)> {
+/// Byte length of an open tag at the start of `text`, its name, and whether it
+/// is self-closing. The caller decides if that name is a wrapper.
+fn parse_open_tag(text: &str) -> Option<(usize, String, bool)> {
     let bytes = text.as_bytes();
     if bytes.first() != Some(&b'<') {
         return None;
@@ -262,14 +256,16 @@ fn parse_injected_open(text: &str) -> Option<(usize, String, bool)> {
         return None;
     }
     let name_start = index;
-    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+    while index < bytes.len()
+        && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] == b'-')
+    {
         index += 1;
     }
     if index == name_start {
         return None;
     }
     let name = text[name_start..index].to_string();
-    if !is_injected_tag(&name) {
+    if !name.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
         return None;
     }
     while index < bytes.len() && bytes[index] != b'>' {
@@ -309,7 +305,12 @@ fn find_injected_span(text: &str) -> Option<(usize, usize)> {
                 return Some((at, end));
             }
         }
-        if let Some((open_len, name, self_closing)) = parse_injected_open(&text[at..]) {
+        if let Some((open_len, name, self_closing)) = parse_open_tag(&text[at..]) {
+            let leading = text[..at].chars().all(char::is_whitespace);
+            if !is_wrapper_tag(&name, leading) {
+                search_from = at + 1;
+                continue;
+            }
             if self_closing {
                 return Some((at, at + open_len));
             }
@@ -318,7 +319,12 @@ fn find_injected_span(text: &str) -> Option<(usize, usize)> {
             if let Some(rel_close) = text[after..].find(&close) {
                 return Some((at, after + rel_close + close.len()));
             }
-            return Some((at, text.len()));
+            // An unclosed leading wrapper is the whole injection. An unclosed
+            // tag later in the text only drops the open tag, not the question.
+            if leading {
+                return Some((at, text.len()));
+            }
+            return Some((at, at + open_len));
         }
         search_from = at + 1;
     }
@@ -414,33 +420,40 @@ fn prompts_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
     kept
 }
 
-fn session_title(sqlite_title: &str, rollout: &Path) -> String {
-    first_real_prompt_in_file(rollout).unwrap_or_else(|| fallback_title(sqlite_title))
+/// `Ok(None)` means the rollout was read and has no real typed prompt, so the
+/// session is hidden. `Err` means the file could not be read; the sqlite title
+/// is the fallback.
+fn session_title(sqlite_title: &str, rollout: &Path) -> Option<String> {
+    match first_real_prompt_in_file(rollout) {
+        Ok(Some(text)) => Some(text),
+        Ok(None) => None,
+        Err(()) => Some(fallback_title(sqlite_title)),
+    }
 }
 
-fn first_real_prompt_in_file(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+fn first_real_prompt_in_file(path: &Path) -> Result<Option<String>, ()> {
+    let file = File::open(path).map_err(|_| ())?;
     let reader = BufReader::new(file);
     let mut scanned = 0usize;
     for line in reader.lines() {
-        let line = line.ok()?;
+        let line = line.map_err(|_| ())?;
         scanned = scanned.saturating_add(line.len());
         if let Some(text) = prompt_from_line(&line) {
-            return Some(text);
+            return Ok(Some(text));
         }
         if scanned > 8 * 1024 * 1024 {
             break;
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
-fn title_from_sources(sqlite_title: &str, rollout_text: &str) -> String {
-    prompts_from_lines(rollout_text.lines())
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| fallback_title(sqlite_title))
+fn title_from_sources(sqlite_title: &str, rollout_text: &str) -> Option<String> {
+    if rollout_text.trim().is_empty() {
+        return Some(fallback_title(sqlite_title));
+    }
+    prompts_from_lines(rollout_text.lines()).into_iter().next()
 }
 
 #[cfg(test)]
@@ -690,15 +703,37 @@ pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
   let sqlite = "# AGENTS.md instructions for D:\\3Dauto\\nantao-backup <INSTRUCTIONS> 工作区约定";
   assert_eq!(
    title_from_sources(sqlite, rollout),
-   "现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了"
+   Some("现在可以把这个文件夹目录改为这个设计产品geo服务的海外独立站了".to_string())
   );
-  assert_eq!(
-   title_from_sources(sqlite, ""),
-   "Codex 会话"
-  );
+  assert_eq!(title_from_sources(sqlite, ""), Some("Codex 会话".to_string()));
   assert_eq!(
    title_from_sources("sqlite 里的短标题", ""),
-   "sqlite 里的短标题"
+   Some("sqlite 里的短标题".to_string())
+  );
+ }
+ #[test]
+ fn user_prompts_drop_generic_xml_wrappers() {
+  let injected = r##"
+{"type":"event_msg","payload":{"type":"user_message","message":"<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<recommended_plugins> Here is a list of plugins that are available but not installed..."}}
+"##;
+  assert!(parse_user_prompts(injected).is_empty());
+  assert_eq!(title_from_sources("线程标题", injected), None);
+  let mixed = r##"
+{"type":"event_msg","payload":{"type":"user_message","message":"<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<recommended_plugins> Here is a list of plugins that are available but not installed...</recommended_plugins>\n帮我改海外独立站，并比较 a < b"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"请用 <div>hello</div> 排版，不要装插件"}}
+"##;
+  assert_eq!(
+   parse_user_prompts(mixed),
+   vec![
+    "帮我改海外独立站，并比较 a < b".to_string(),
+    "请用 <div>hello</div> 排版，不要装插件".to_string()
+   ]
+  );
+  assert_eq!(
+   title_from_sources("线程标题", mixed),
+   Some("帮我改海外独立站，并比较 a < b".to_string())
   );
  }
  #[test]
