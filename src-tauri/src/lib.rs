@@ -368,54 +368,103 @@ fn launch_physical_size(scale: f64, reset_to_start: bool) -> (f64, f64) {
     (START_LOGICAL_W * scale, START_LOGICAL_H * scale)
 }
 
-fn log_path() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let local = local.trim();
-            if !local.is_empty() {
-                return PathBuf::from(local)
-                    .join("com.pcj1997.ai-traffic-light")
-                    .join("logs")
-                    .join("app.log");
-            }
-        }
+fn local_log_path() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    if local.is_empty() {
+        return None;
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ai-traffic-light")
-        .join("logs")
-        .join("app.log")
+    Some(
+        PathBuf::from(local)
+            .join("com.pcj1997.ai-traffic-light")
+            .join("logs")
+            .join("app.log"),
+    )
 }
 
-fn log_line(message: &str) {
+fn exe_log_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("ai-traffic-light.log"))
+}
+
+fn temp_log_path() -> Option<PathBuf> {
+    let temp = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP"))?;
+    if temp.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(temp).join("ai-traffic-light.log"))
+}
+
+/// `append(true)` alone fails to create a new file on some Windows std builds.
+/// Read access is required for that create+append combination.
+fn write_log_line(path: &std::path::Path, line: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if parent.components().next().is_some() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    file.write_all(line)?;
+    file.flush()?;
+    let _ = file.sync_data();
+    Ok(())
+}
+
+pub(crate) fn log_line(message: &str) {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0);
     let line = format!("{millis} {message}\n");
-    let Ok(guard) = LOG_LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        return;
-    };
-    let path = log_path();
-    let write = (|| -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let bytes = line.as_bytes();
+    let _guard = LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut wrote = false;
+    let mut failures: Vec<String> = Vec::new();
+    if let Some(path) = local_log_path() {
+        match write_log_line(&path, bytes) {
+            Ok(()) => wrote = true,
+            Err(error) => failures.push(format!("LOCALAPPDATA {} ({error})", path.display())),
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        file.write_all(line.as_bytes())?;
-        Ok(())
-    })();
-    drop(guard);
-    let _ = write;
+    } else {
+        failures.push("LOCALAPPDATA is unset".to_string());
+    }
+    if !wrote {
+        if let Some(path) = exe_log_path() {
+            let note = format!(
+                "{millis} {message} | local log failed: {}\n",
+                failures.join("; ")
+            );
+            match write_log_line(&path, note.as_bytes()) {
+                Ok(()) => wrote = true,
+                Err(error) => failures.push(format!("exe {} ({error})", path.display())),
+            }
+        }
+    }
+    if !wrote {
+        if let Some(path) = temp_log_path() {
+            let note = format!(
+                "{millis} {message} | log sinks failed: {}\n",
+                failures.join("; ")
+            );
+            let _ = write_log_line(&path, note.as_bytes());
+        }
+    }
 }
 
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The panicking thread may already hold LOG_LOCK. Write without it.
+        if LOGGING_PANIC.swap(true, Ordering::SeqCst) {
+            previous(info);
+            return;
+        }
         let location = info
             .location()
             .map(|site| format!("{}:{}:{}", site.file(), site.line(), site.column()))
@@ -426,27 +475,54 @@ fn install_panic_hook() {
             .map(|text| (*text).to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "non-string panic payload".to_string());
-        // Write the file directly. `log_line` takes LOG_LOCK, and the panicking
-        // thread may already hold it — locking again here would deadlock.
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or(0);
         let line = format!("{millis} PANIC at {location}: {message}\n");
-        let path = log_path();
-        let _ = (|| -> std::io::Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+        let bytes = line.as_bytes();
+        let mut wrote = false;
+        if let Some(path) = local_log_path() {
+            wrote = write_log_line(&path, bytes).is_ok();
+        }
+        if !wrote {
+            if let Some(path) = exe_log_path() {
+                wrote = write_log_line(&path, bytes).is_ok();
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            file.write_all(line.as_bytes())?;
-            Ok(())
-        })();
+        }
+        if !wrote {
+            if let Some(path) = temp_log_path() {
+                let _ = write_log_line(&path, bytes);
+            }
+        }
+        LOGGING_PANIC.store(false, Ordering::SeqCst);
         previous(info);
     }));
+}
+
+static LOGGING_INIT: OnceLock<()> = OnceLock::new();
+static LOGGING_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// First thing `main` calls, before `tauri::Builder`. Safe to call twice.
+pub fn init_logging() {
+    LOGGING_INIT.get_or_init(|| {
+        install_panic_hook();
+        log_line(&format!(
+            "main enter pid={} cwd={:?} exe={:?} args={:?} LOCALAPPDATA={:?} TEMP={:?}",
+            std::process::id(),
+            std::env::current_dir().ok(),
+            std::env::current_exe().ok(),
+            std::env::args().collect::<Vec<_>>(),
+            std::env::var("LOCALAPPDATA").ok(),
+            std::env::var("TEMP").ok()
+        ));
+        log_line(&format!(
+            "log sinks local={:?} exe={:?} temp={:?}",
+            local_log_path(),
+            exe_log_path(),
+            temp_log_path()
+        ));
+    });
 }
 
 fn place_primary_top_right(
@@ -528,6 +604,7 @@ fn log_monitors(window: &tauri::WebviewWindow) {
 }
 
 fn open_configured_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    log_line("open_configured_window enter");
     let config = app
         .config()
         .app
@@ -546,12 +623,81 @@ fn open_configured_window(app: &AppHandle) -> Result<tauri::WebviewWindow, Strin
         config.x,
         config.y
     ));
+    log_line("from_config build begin");
     let window = tauri::WebviewWindowBuilder::from_config(app, &config)
         .map_err(|error| error.to_string())?
         .visible(true)
         .build()
         .map_err(|error| error.to_string())?;
+    log_line("from_config build returned");
     Ok(window)
+}
+
+#[cfg(windows)]
+fn log_top_level_windows(stage: &str) {
+    use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    use winapi::um::winuser::{
+        EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
+    };
+
+    struct Found(Mutex<Vec<String>>);
+    static FOUND: OnceLock<Found> = OnceLock::new();
+    let found = FOUND.get_or_init(|| Found(Mutex::new(Vec::new())));
+    if let Ok(mut rows) = found.0.lock() {
+        rows.clear();
+    }
+    let pid = unsafe { GetCurrentProcessId() };
+    unsafe extern "system" fn visit(hwnd: HWND, pid: LPARAM) -> BOOL {
+        let mut owner: DWORD = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut owner) };
+        if owner != pid as DWORD {
+            return TRUE;
+        }
+        let mut class = [0u16; 128];
+        let mut title = [0u16; 128];
+        let class_len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        let title_len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
+        let title = String::from_utf16_lossy(&title[..title_len.max(0) as usize]);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        let visible = unsafe { IsWindowVisible(hwnd) != 0 };
+        if let Some(Found(rows)) = FOUND.get() {
+            if let Ok(mut rows) = rows.lock() {
+                rows.push(format!(
+                    "hwnd={:?} class={class:?} title={title:?} vis={visible} {},{} {}x{}",
+                    hwnd,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ));
+            }
+        }
+        TRUE
+    }
+    unsafe { EnumWindows(Some(visit), pid as LPARAM) };
+    let rows = found.0.lock().map(|rows| rows.clone()).unwrap_or_default();
+    if rows.is_empty() {
+        log_line(&format!("windows[{stage}] pid={pid} (none)"));
+    } else {
+        for row in rows {
+            log_line(&format!("windows[{stage}] {row}"));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn log_top_level_windows(stage: &str) {
+    log_line(&format!("windows[{stage}] skipped"));
 }
 
 fn open_fallback_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
@@ -566,6 +712,23 @@ fn open_fallback_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
         .resizable(false)
         .skip_taskbar(true)
         .shadow(false)
+        .visible(true)
+        .focused(true)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn open_plain_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    log_line("creating plain (non-transparent) window");
+    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+        .title("AI Traffic Light")
+        .inner_size(START_LOGICAL_W, START_LOGICAL_H)
+        .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
+        .decorations(true)
+        .transparent(false)
+        .always_on_top(true)
+        .resizable(true)
+        .skip_taskbar(false)
         .visible(true)
         .focused(true)
         .build()
@@ -601,15 +764,30 @@ fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
     match fallback {
         Ok(Ok(())) => {
             log_line("fallback window created");
+            return Ok(());
+        }
+        Ok(Err(error)) => log_line(&format!("fallback window failed: {error}")),
+        Err(_) => log_line("fallback window panicked"),
+    }
+    if app.get_webview_window("main").is_some() {
+        log_line("main window appeared after transparent fallback");
+        return Ok(());
+    }
+    let plain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_plain_window(app).map(|_| ())
+    }));
+    match plain {
+        Ok(Ok(())) => {
+            log_line("plain window created");
             Ok(())
         }
         Ok(Err(error)) => {
-            log_line(&format!("fallback window failed: {error}"));
+            log_line(&format!("plain window failed: {error}"));
             Err(error)
         }
         Err(_) => {
-            log_line("fallback window panicked");
-            Err("fallback window panicked".to_string())
+            log_line("plain window panicked");
+            Err("plain window panicked".to_string())
         }
     }
 }
@@ -807,9 +985,28 @@ fn resize_light_to_fit(window: tauri::WebviewWindow, width: f64, height: f64) {
     }
 }
 
+static STATUS_CACHE: OnceLock<Mutex<StatusSnapshot>> = OnceLock::new();
+
+fn cache_status(snapshot: StatusSnapshot) {
+    if let Ok(mut slot) = STATUS_CACHE
+        .get_or_init(|| Mutex::new(StatusSnapshot::idle()))
+        .lock()
+    {
+        *slot = snapshot;
+    }
+}
+
+fn cached_status() -> StatusSnapshot {
+    STATUS_CACHE
+        .get()
+        .and_then(|slot| slot.lock().ok().map(|snapshot| snapshot.clone()))
+        .unwrap_or_else(StatusSnapshot::idle)
+}
+
 #[tauri::command]
 fn get_status() -> StatusSnapshot {
-    bridge::read()
+    // The webview polls this every 200ms. Disk and sqlite stay on the reader thread.
+    cached_status()
 }
 
 #[derive(serde::Serialize)]
@@ -818,8 +1015,7 @@ struct PromptPage {
     note: String,
 }
 
-#[tauri::command]
-fn session_user_prompts(client: String, id: String) -> Result<PromptPage, String> {
+fn session_user_prompts_sync(client: String, id: String) -> Result<PromptPage, String> {
     if client != "codex" {
         return Ok(PromptPage {
             prompts: Vec::new(),
@@ -836,6 +1032,13 @@ fn session_user_prompts(client: String, id: String) -> Result<PromptPage, String
         prompts,
         note: note.to_string(),
     })
+}
+
+#[tauri::command]
+async fn session_user_prompts(client: String, id: String) -> Result<PromptPage, String> {
+    tauri::async_runtime::spawn_blocking(move || session_user_prompts_sync(client, id))
+        .await
+        .map_err(|err| format!("读取提问失败：{err}"))?
 }
 
 #[tauri::command]
@@ -912,28 +1115,46 @@ fn window_ready(app: AppHandle) {
     }
 }
 
+fn start_session_readers(app: AppHandle) {
+    // Sqlite, rollout jsonl, powershell probes, and the notify config file all
+    // stay off the UI thread, and they start only after the window exists.
+    thread::spawn(move || {
+        log_line("readers: starting off the UI thread");
+        marvis::start();
+        zcode::start();
+        coze::start();
+        trae::start();
+        doubao::start();
+        codex_local::start();
+        workbuddy_local::start();
+        reporter::start();
+        notify::start(app);
+        log_line("readers: worker threads spawned");
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    install_panic_hook();
-    log_line(&format!(
-        "start cwd={:?} exe={:?} args={:?}",
-        std::env::current_dir().ok(),
-        std::env::current_exe().ok(),
-        std::env::args().collect::<Vec<_>>()
-    ));
-    log_line(&format!("log file {}", log_path().display()));
+    init_logging();
+    log_line("run enter, before tauri::Builder");
+    log_line("plugin register: single-instance");
     let builder = tauri::Builder::default()
         // Must be the first plugin: a second launch (shortcut re-click, duplicate
         // autostart entry) exits here and just raises the existing window instead
-        // of stacking another lamp.
+        // of stacking another lamp. Its setup calls process::exit on the second
+        // process, which is why "setup begin" can be missing from that process.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log_line("single-instance callback");
             let queued = app.clone();
             let _ = app.run_on_main_thread(move || {
                 let place = main_window_hidden(&queued) || launch_should_place();
                 present_main_window(&queued, place, false, true);
             });
-        }))
-        .plugin(tauri_plugin_notification::init())
+        }));
+    log_line("plugin register: notification");
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    log_line("plugin register: autostart");
+    let builder = builder
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -956,34 +1177,33 @@ pub fn run() {
             reporter::report_status
         ])
         .setup(|app| {
-            log_line("setup begin");
+            log_line("setup begin (plugins already finished)");
+            log_top_level_windows("setup-begin");
             if std::env::args().any(|a| a == "--enable-autostart") {
+                log_line("autostart enable begin");
                 match app.autolaunch().enable() {
                     Ok(()) => log_line("autostart enabled"),
                     Err(error) => log_line(&format!("autostart error: {error}")),
                 }
             }
+            log_line("bridge::start begin");
             if let Err(error) = bridge::start() {
                 log_line(&format!("bridge start error: {error}"));
                 return Err(std::io::Error::other(error.to_string()).into());
             }
-            marvis::start();
-            zcode::start();
-            coze::start();
-            trae::start();
-            doubao::start();
-            codex_local::start();
-            workbuddy_local::start();
-            reporter::start();
-            notify::start(app.handle().clone());
+            log_line("bridge::start ok");
 
             // The config window is not auto-created (`create: false`). Build it
             // here so a failure is logged and the fallback builder can run,
-            // instead of Tauri panicking before this hook.
+            // instead of Tauri panicking before this hook. Session readers stay
+            // off this thread until the window and tray exist.
             let _ = launch_clock();
+            log_line("ensure_main_window begin");
             if let Err(error) = ensure_main_window(app.handle()) {
                 log_line(&format!("setup ensure failed: {error}"));
             }
+            log_line("ensure_main_window returned");
+            log_top_level_windows("after-create");
             if let Some(window) = app.get_webview_window("main") {
                 let rebuild = app.handle().clone();
                 window.on_window_event(move |event| match event {
@@ -1072,8 +1292,9 @@ pub fn run() {
             let autostart_item = CheckMenuItemBuilder::with_id("autostart", "开机自启动")
                 .checked(autostart_enabled)
                 .build(app)?;
+            log_line("tray menu build");
             let notify_item = CheckMenuItemBuilder::with_id("notify-toggle", "会话完成通知")
-                .checked(notify::load_notify_enabled())
+                .checked(notify::enabled())
                 .build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "退出").build(app)?;
             let menu = MenuBuilder::new(app)
@@ -1088,6 +1309,7 @@ pub fn run() {
 
             let menu_autostart_item = autostart_item.clone();
             let menu_notify_item = notify_item.clone();
+            log_line("tray icon build begin");
             let tray = TrayIconBuilder::with_id("main")
                 .icon(tray_icon("idle"))
                 .tooltip("AI Traffic Light：空闲")
@@ -1127,18 +1349,31 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            log_line("tray icon build ok");
 
             let app_handle = app.handle().clone();
             let status_autostart_item = autostart_item.clone();
+            let status_notify_item = notify_item.clone();
             thread::spawn(move || {
+                log_line("status thread enter");
                 let mut system = sysinfo::System::new();
+                let mut logged_scan = false;
                 loop {
                     // Presence still feeds the tray and team report. It must not hide
                     // the lamp: sessions are readable when the client process name
                     // does not match, and the window is meant to stay on screen.
+                    let scan_started = Instant::now();
                     presence::refresh(&mut system);
+                    if !logged_scan {
+                        logged_scan = true;
+                        log_line(&format!(
+                            "status thread: process scan {}ms",
+                            scan_started.elapsed().as_millis()
+                        ));
+                    }
                     thread::sleep(Duration::from_millis(500));
                     let snapshot = bridge::read();
+                    cache_status(snapshot.clone());
                     let tooltip = if snapshot.session_count > 0 {
                         format!(
                             "AI Traffic Light：{} | {} 个会话状态",
@@ -1150,6 +1385,7 @@ pub fn run() {
                     let _ = tray.set_tooltip(Some(&tooltip));
                     let _ = tray.set_icon(Some(tray_icon(&snapshot.state)));
                     let _ = status_item.set_text(tooltip);
+                    let _ = status_notify_item.set_checked(notify::enabled());
                     if let Ok(enabled) = app_handle.autolaunch().is_enabled() {
                         let _ = status_autostart_item.set_checked(enabled);
                     }
@@ -1159,12 +1395,15 @@ pub fn run() {
                 }
             });
 
+            start_session_readers(app.handle().clone());
+            log_top_level_windows("setup-end");
             log_line("setup end");
             Ok(())
         });
+    log_line("builder.build begin");
     match builder.build(tauri::generate_context!()) {
         Ok(app) => {
-            log_line("builder ok");
+            log_line("builder ok, entering event loop");
             app.run(|app, event| match event {
                 tauri::RunEvent::Ready => {
                     log_line("RunEvent::Ready");

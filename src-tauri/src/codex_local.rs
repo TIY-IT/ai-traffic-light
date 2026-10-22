@@ -70,15 +70,26 @@ fn read(home:&Path)->Result<Vec<SessionSnapshot>,Box<dyn std::error::Error>>{
  }
  Ok(aggregate(&rows,now))
 }
-pub fn start(){std::thread::spawn(||loop{
- // Sessions live in the local sqlite even when the process name is not exactly
- // "codex", so the list must not wait on presence before the first read.
- let active=crate::presence::get_active_clients().iter().any(|c|c=="codex");
- if let Some(home)=dirs::home_dir(){
-  let root=home.join(".codex");
-  if root.join("state_5.sqlite").is_file(){if let Ok(rows)=read(&root){if let Ok(mut cache)=CACHE.lock(){*cache=Some((Instant::now(),rows));}}}
+pub fn start(){std::thread::spawn(||{
+ let mut first=true;
+ loop{
+  // Sessions live in the local sqlite even when the process name is not exactly
+  // "codex", so the list must not wait on presence before the first read.
+  // This thread is the only place that opens state_5.sqlite or rollout jsonl.
+  let began=Instant::now();
+  if first { crate::log_line("codex: sqlite read begin"); }
+  let active=crate::presence::get_active_clients().iter().any(|c|c=="codex");
+  if let Some(home)=dirs::home_dir(){
+   let root=home.join(".codex");
+   if root.join("state_5.sqlite").is_file(){if let Ok(rows)=read(&root){if let Ok(mut cache)=CACHE.lock(){*cache=Some((Instant::now(),rows));}}}
+  }
+  let elapsed=began.elapsed();
+  if first || elapsed>Duration::from_millis(200) {
+   crate::log_line(&format!("codex: sqlite read done in {}ms", elapsed.as_millis()));
+  }
+  first=false;
+  std::thread::sleep(Duration::from_millis(if active {500} else {2000}));
  }
- std::thread::sleep(Duration::from_millis(if active {500} else {2000}));
 });}
 pub fn sessions()->Vec<SessionSnapshot>{CACHE.lock().ok().and_then(|c|c.as_ref().filter(|(at,_)|at.elapsed()<Duration::from_secs(5)).map(|(_,r)|r.clone())).unwrap_or_default()}
 
