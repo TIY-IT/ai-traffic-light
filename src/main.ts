@@ -31,6 +31,15 @@ interface SessionSnapshot {
   created_at: number;
 }
 
+interface PromptPage {
+  prompts: string[];
+  note: string;
+}
+
+const knownClients = ["codex", "workbuddy", "marvis", "zcode", "coze", "trae", "doubao"];
+let selectedSessionId: string | null = null;
+let promptView: { id: string; note: string; prompts: string[]; error: string } | null = null;
+
 const housings = Array.from(document.querySelectorAll<HTMLElement>(".housing"));
 const statusLabel = document.querySelector<HTMLElement>("#status-label");
 const sessionCount = document.querySelector<HTMLElement>("#session-count");
@@ -60,8 +69,8 @@ function clientLabel(client: string) {
 
 const stateBadgeText: Record<Status, string> = {
   working: "运行中",
-  completed: "已结束",
-  waiting: "待处理",
+  completed: "已停止",
+  waiting: "等待",
   error: "异常",
   idle: "空闲",
 };
@@ -165,8 +174,7 @@ function publishHitRegions() {
   invoke("set_hit_regions", { rects }).catch(() => {});
 }
 
-function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy", "marvis", "zcode", "coze", "trae", "doubao"]) {
-  snapshot = {...snapshot, sessions: snapshot.sessions.filter(s => activeClients.includes(s.client))};
+function render(snapshot: StatusSnapshot) {
   snapshot.session_count = snapshot.sessions.length;
 
   // 红灯语义 = "新鲜度":只有 15 分钟内结束的会话才点亮红灯,更早的视为陈旧。
@@ -195,7 +203,7 @@ function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy",
   }
 
   for (const housing of housings) {
-    housing.hidden = !activeClients.includes(housing.dataset.client || "");
+    housing.hidden = false;
     const sessions = snapshot.sessions.filter(s => s.client === housing.dataset.client);
     const running = sessions.filter((s) => s.state === "working").length;
     const freshStopped = sessions.filter(isFresh).length;
@@ -238,17 +246,15 @@ function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy",
         : "暂无会话记录";
   }
   if (sessionList) {
-    const clients = Array.from(
-      new Set(snapshot.sessions.map((session) => session.client)),
-    ).sort((left, right) => {
-      const firstOpenedAt = (client: string) =>
-        Math.min(
-          ...snapshot.sessions
-            .filter((session) => session.client === client)
-            .map((session) => session.created_at),
-        );
-      return firstOpenedAt(left) - firstOpenedAt(right);
-    });
+    const extras = Array.from(
+      new Set(
+        snapshot.sessions
+          .map((session) => session.client)
+          .filter((client) => !knownClients.includes(client)),
+      ),
+    );
+    const clients = [...knownClients, ...extras];
+    const scrollTop = sessionList.scrollTop;
     sessionList.replaceChildren(
       ...clients.flatMap((client) => {
         const groupTitle = document.createElement("li");
@@ -266,6 +272,10 @@ function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy",
           .map((session) => {
             const item = document.createElement("li");
             item.className = `session-item session-${session.state}`;
+            if (selectedSessionId === session.id) item.classList.add("is-selected");
+
+            const row = document.createElement("div");
+            row.className = "session-row";
 
             const dot = document.createElement("span");
             dot.className = "session-dot";
@@ -280,33 +290,56 @@ function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy",
             remove.title = "删除会话记录";
             remove.setAttribute("aria-label", `删除 ${session.title}`);
             remove.textContent = "×";
-            remove.addEventListener("click", async () => {
+            remove.hidden = true;
+            remove.addEventListener("click", async (event) => {
+              event.stopPropagation();
               remove.disabled = true;
               await invoke("remove_session", { id: session.id });
               await refresh();
             });
 
-            // 单行布局:标题是唯一内容行,message/label 副行不再渲染。
             const heading = document.createElement("span");
             heading.className = "session-heading";
-
             const title = document.createElement("strong");
             title.textContent = session.title;
-
-            remove.hidden = true;
-            // 点击会话行把该会话所属的 AI 客户端窗口调到前台;失败静默。
-            item.title = "点击切换到该会话窗口";
-            item.addEventListener("click", () => {
-              invoke("focus_session", { client: session.client, id: session.id }).catch(() => {});
-            });
             heading.append(title);
-            item.append(dot, heading, badge, remove);
+
+            row.append(dot, heading, badge, remove);
+            item.append(row);
+            item.title = "查看你的提问";
+            item.addEventListener("click", (event) => {
+              if ((event.target as HTMLElement | null)?.closest(".prompt-list")) return;
+              void selectSession(session);
+            });
+
+            if (selectedSessionId === session.id && promptView?.id === session.id) {
+              const prompts = document.createElement("ul");
+              prompts.className = "prompt-list";
+              const note = document.createElement("li");
+              note.className = promptView.error ? "prompt-error" : "prompt-note";
+              note.textContent = promptView.error || promptView.note;
+              prompts.append(note);
+              for (const text of promptView.prompts) {
+                const line = document.createElement("li");
+                line.className = "prompt-item";
+                line.textContent = text;
+                prompts.append(line);
+              }
+              item.append(prompts);
+            }
             return item;
           });
 
+        if (sessions.length === 0) {
+          const empty = document.createElement("li");
+          empty.className = "session-empty";
+          empty.textContent = "暂无会话";
+          return [groupTitle, empty];
+        }
         return [groupTitle, ...sessions];
       }),
     );
+    sessionList.scrollTop = scrollTop;
   }
   if (clearSessionsButton) {
     // 快照里存在已结束会话时才显示"清空已停"入口。
@@ -319,26 +352,56 @@ function render(snapshot: StatusSnapshot, activeClients = ["codex", "workbuddy",
   }
   prevStateSeeded = true;
   if (justEndedClients.size > 0) void playDing();
-  // Keep the window width hugging the visible content (no invisible dead strip):
-  // rightmost lamp housing, or the expanded panel stack when present.
-  const rights: number[] = [];
-  housings.forEach((housing) => {
-    if (housing.hidden) return;
-    const rect = housing.getBoundingClientRect();
-    if (rect.width > 0 && rect.height > 0) rights.push(rect.right);
-  });
-  if (panelStack && getComputedStyle(panelStack).display !== "none") {
-    rights.push(panelStack.getBoundingClientRect().right);
+  const widget = document.querySelector<HTMLElement>(".widget");
+  if (widget) {
+    const rect = widget.getBoundingClientRect();
+    const width = Math.ceil(rect.width) + 12;
+    const height = Math.ceil(rect.height) + 12;
+    if (width >= 80 && height >= 80) {
+      invoke("resize_light_to_fit", { width, height }).catch(() => {});
+    }
   }
-  const needWidth = rights.length ? Math.max(...rights) + 14 : 0;
-  if (needWidth > 0) invoke("resize_light_to_fit", { width: needWidth }).catch(() => {});
   publishHitRegions();
+}
+
+async function selectSession(session: SessionSnapshot) {
+  if (selectedSessionId === session.id) {
+    selectedSessionId = null;
+    promptView = null;
+    await refresh();
+    return;
+  }
+  selectedSessionId = session.id;
+  promptView = {
+    id: session.id,
+    note: "正在读取你的提问…",
+    prompts: [],
+    error: "",
+  };
+  await refresh();
+  try {
+    const page = await invoke<PromptPage>("session_user_prompts", {
+      client: session.client,
+      id: session.id,
+    });
+    if (selectedSessionId !== session.id) return;
+    promptView = { id: session.id, note: page.note, prompts: page.prompts, error: "" };
+  } catch (error) {
+    if (selectedSessionId !== session.id) return;
+    promptView = {
+      id: session.id,
+      note: "",
+      prompts: [],
+      error: `读取失败：${String(error)}`,
+    };
+  }
+  await refresh();
 }
 
 async function refresh() {
   try {
-    const [snapshot, clients] = await Promise.all([invoke<StatusSnapshot>("get_status"), invoke<string[]>("get_active_clients")]);
-    render(snapshot, clients);
+    const snapshot = await invoke<StatusSnapshot>("get_status");
+    render(snapshot);
   } catch (error) {
     console.error("Failed to refresh AI client status", error);
   }
