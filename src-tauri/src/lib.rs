@@ -75,9 +75,9 @@ fn focus_session(client: String, id: String) -> Result<(), String> {
 // Launch multiplies this by that monitor's own scale factor (physical px).
 const DEFAULT_INSET: f64 = 16.0;
 const MIN_LOGICAL_W: f64 = 240.0;
-const MAX_LOGICAL_W: f64 = 920.0;
+const MAX_LOGICAL_W: f64 = 1400.0;
 const MIN_LOGICAL_H: f64 = 168.0;
-const MAX_LOGICAL_H: f64 = 720.0;
+const MAX_LOGICAL_H: f64 = 980.0;
 const START_LOGICAL_W: f64 = 780.0;
 const START_LOGICAL_H: f64 = 480.0;
 
@@ -1762,6 +1762,8 @@ mod tests {
     fn fit_size_ignores_collapsed_outer_measurement() {
         let fitted = super::fit_logical_size(720.0, 420.0).unwrap();
         assert_eq!(fitted, (720.0, 420.0));
+        let wide = super::fit_logical_size(1100.0, 800.0).unwrap();
+        assert_eq!(wide, (1100.0, 800.0));
         assert!(fitted.0 >= 240.0 && fitted.1 >= 168.0);
         assert!(super::fit_logical_size(f64::NAN, 400.0).is_none());
         let tiny = super::fit_logical_size(16.0, 16.0).unwrap();

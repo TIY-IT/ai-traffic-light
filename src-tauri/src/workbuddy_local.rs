@@ -20,6 +20,6 @@ pub fn sessions()->Vec<SessionSnapshot>{
  v["tasks"].as_array().map(|tasks|tasks.iter().filter_map(|t|{
   let id=t["threadId"].as_str()?;if !id.starts_with("workbuddy:"){return None;}
   let(state,label)=match t["mode"].as_str()?{"working"|"executing"=>("working","运行中"),"waiting"=>("waiting","已停 / 待处理"),_=>("idle","暂无状态")};
-  Some(SessionSnapshot{id:id.into(),client:"workbuddy".into(),title:t["title"].as_str().unwrap_or("WorkBuddy").chars().take(80).collect(),state:state.into(),label:label.into(),message:label.into(),created_at:0,updated_at:now})
+  Some(SessionSnapshot{id:id.into(),client:"workbuddy".into(),title:t["title"].as_str().unwrap_or("WorkBuddy").to_string(),state:state.into(),label:label.into(),message:label.into(),created_at:0,updated_at:now})
  }).collect()).unwrap_or_default()
 }

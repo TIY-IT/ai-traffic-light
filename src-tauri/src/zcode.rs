@@ -50,7 +50,7 @@ fn read(path: &std::path::Path) -> rusqlite::Result<Vec<SessionSnapshot>> {
             let (children,unknown)=descendants(&db,&id,cutoff.unwrap_or(updated as i64).max(0) as u64,now)?;
             let child_label=format!("运行中 · {} 个子代理",children);
             let (state,label)=if children>0 {("working",child_label.as_str())} else if unknown>0 && state=="completed" {("idle","子代理状态待确认")} else {(state,label)};
-            sessions.push(SessionSnapshot {id:format!("zcode:{id}"),client:"zcode".into(),title:title.chars().take(80).collect(),state:state.into(),label:label.into(),message:label.into(),updated_at:stamp/1000,created_at:0});
+            sessions.push(SessionSnapshot {id:format!("zcode:{id}"),client:"zcode".into(),title,state:state.into(),label:label.into(),message:label.into(),updated_at:stamp/1000,created_at:0});
         }
     }
     Ok(sessions)

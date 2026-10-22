@@ -154,7 +154,8 @@ body[data-state="idle"] .light-green {
 
 .panel-stack {
   display: none;
-  width: 240px;
+  width: max-content;
+  max-width: 760px;
   max-height: calc(100vh - 16px);
   align-self: flex-start;
   flex-direction: column;
@@ -174,7 +175,8 @@ body[data-state="idle"] .light-green {
 
 .panel {
   display: flex;
-  width: 240px;
+  width: 440px;
+  max-width: 760px;
   min-height: 0;
   padding: 11px;
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -186,6 +188,12 @@ body[data-state="idle"] .light-green {
 
 .panel-stack > .panel:not(.hooks-warning):not(.team-panel) {
   flex: 1 1 auto;
+  height: 520px;
+  min-width: 320px;
+  min-height: 300px;
+  max-height: 780px;
+  overflow: hidden;
+  resize: both;
 }
 
 #open-team {
@@ -222,7 +230,6 @@ body[data-state="idle"] .light-green {
 .session-list {
   display: flex;
   min-height: 0;
-  max-height: 280px;
   margin: 2px 0 0;
   padding: 0;
   flex: 1 1 auto;
@@ -283,10 +290,10 @@ body[data-state="idle"] .light-green {
 
 .session-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 5px;
   min-width: 0;
-  padding: 3px 6px;
+  padding: 4px 6px;
 }
 
 .session-empty {
@@ -318,12 +325,10 @@ body[data-state="idle"] .light-green {
 
 .prompt-item {
   color: rgba(255, 255, 255, 0.9);
-  font-size: 10px;
-  line-height: 1.35;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .session-item:hover {
@@ -334,6 +339,7 @@ body[data-state="idle"] .light-green {
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
+  margin-top: 4px;
   border-radius: 50%;
   background: #6b7280;
 }
@@ -351,10 +357,10 @@ body[data-state="idle"] .light-green {
   background: #ef4444;
 }
 
-/* 单行会话行:状态点 + 标题(ellipsis) + 右侧状态小字,badge 不再是胶囊。 */
 .session-state-badge {
   flex-shrink: 0;
-  max-width: 46px;
+  max-width: 52px;
+  margin-top: 2px;
   margin-left: auto;
   overflow: hidden;
   background: none;
@@ -370,18 +376,22 @@ body[data-state="idle"] .light-green {
 }
 
 .session-heading {
-  display: flex;
+  display: block;
   min-width: 0;
   flex: 1;
-  align-items: center;
 }
 
 .session-heading strong {
+  display: -webkit-box;
   min-width: 0;
   overflow: hidden;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .session-remove {

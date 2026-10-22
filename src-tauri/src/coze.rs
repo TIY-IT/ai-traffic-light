@@ -16,7 +16,7 @@ fn decode(text: &str, now: u64) -> Vec<SessionSnapshot> {
             return None;
         };
         let (state,label) = match r["status"].as_i64() { Some(1)=>("working","运行中 · 当前会话"),Some(2)=>("completed","已停止 · 当前会话"),_=>("idle","未知状态 · 当前会话") };
-        Some(SessionSnapshot {id,client:"coze".into(),title:r["title"].as_str().unwrap_or("扣子当前会话").chars().take(80).collect(),state:state.into(),label:label.into(),message:label.into(),created_at:now,updated_at:now})
+        Some(SessionSnapshot {id,client:"coze".into(),title:r["title"].as_str().unwrap_or("扣子当前会话").to_string(),state:state.into(),label:label.into(),message:label.into(),created_at:now,updated_at:now})
     }).collect()
 }
 pub fn start() {

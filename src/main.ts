@@ -75,7 +75,7 @@ const stateBadgeText: Record<Status, string> = {
   idle: "空闲",
 };
 
-// 红灯"新鲜度"阈值:15 分钟内结束的会话才点亮红灯,更早的已停不再长红。
+// "刚结束"提示仍用 15 分钟。灯本身不随这个阈值熄灭。
 const FRESH_STOP_SECS = 15 * 60;
 const ENDED_STATES: Status[] = ["completed", "waiting", "error"];
 
@@ -177,7 +177,7 @@ function publishHitRegions() {
 function render(snapshot: StatusSnapshot) {
   snapshot.session_count = snapshot.sessions.length;
 
-  // 红灯语义 = "新鲜度":只有 15 分钟内结束的会话才点亮红灯,更早的视为陈旧。
+  // 灯常亮:运行中绿灯,有已停会话就红灯。超过 15 分钟也不熄灭,窗口不随运行状态隐藏。
   const nowSecs = Date.now() / 1000;
   const isEnded = (s: SessionSnapshot) => ENDED_STATES.includes(s.state);
   const isFresh = (s: SessionSnapshot) =>
@@ -207,8 +207,9 @@ function render(snapshot: StatusSnapshot) {
     const sessions = snapshot.sessions.filter(s => s.client === housing.dataset.client);
     const running = sessions.filter((s) => s.state === "working").length;
     const freshStopped = sessions.filter(isFresh).length;
-    const staleStopped = sessions.filter(isEnded).length - freshStopped;
-    const colorState = running ? "completed" : freshStopped ? "waiting" : "idle";
+    const stopped = sessions.filter(isEnded).length;
+    // 绿灯 = 有会话在跑;红灯 = 没有在跑但有已停会话。没有会话时灯壳仍留在桌面上。
+    const colorState = running ? "completed" : stopped > 0 ? "waiting" : "idle";
     housing.querySelectorAll<HTMLElement>(".light").forEach(light => {
       light.classList.toggle("active", light.dataset.state === colorState);
     });
@@ -216,11 +217,9 @@ function render(snapshot: StatusSnapshot) {
     if (label) {
       label.textContent = running
         ? `${running} 运行${freshStopped ? ` · ${freshStopped} 新停` : ""}`
-        : freshStopped
-          ? `刚结束 ${freshStopped}`
-          : staleStopped > 0
-            ? `已停 ${staleStopped}`
-            : "暂无状态";
+        : stopped > 0
+          ? `已停 ${stopped}`
+          : "暂无状态";
     }
     housing.setAttribute("aria-label", `${clientLabel(housing.dataset.client || "")}：${label?.textContent}`);
     if (justEndedClients.has(housing.dataset.client || "")) flashAttn(housing);
@@ -302,11 +301,12 @@ function render(snapshot: StatusSnapshot) {
             heading.className = "session-heading";
             const title = document.createElement("strong");
             title.textContent = session.title;
+            title.title = session.title;
             heading.append(title);
 
             row.append(dot, heading, badge, remove);
             item.append(row);
-            item.title = "查看你的提问";
+            item.title = session.title || "查看你的提问";
             item.addEventListener("click", (event) => {
               if ((event.target as HTMLElement | null)?.closest(".prompt-list")) return;
               void selectSession(session);
@@ -323,6 +323,7 @@ function render(snapshot: StatusSnapshot) {
                 const line = document.createElement("li");
                 line.className = "prompt-item";
                 line.textContent = text;
+                line.title = text;
                 prompts.append(line);
               }
               item.append(prompts);
@@ -352,16 +353,19 @@ function render(snapshot: StatusSnapshot) {
   }
   prevStateSeeded = true;
   if (justEndedClients.size > 0) void playDing();
-  const widget = document.querySelector<HTMLElement>(".widget");
-  if (widget) {
-    const rect = widget.getBoundingClientRect();
-    const width = Math.ceil(rect.width) + 12;
-    const height = Math.ceil(rect.height) + 12;
-    if (width >= 80 && height >= 80) {
-      invoke("resize_light_to_fit", { width, height }).catch(() => {});
-    }
-  }
+  fitWindowToWidget();
   publishHitRegions();
+}
+
+function fitWindowToWidget() {
+  const widget = document.querySelector<HTMLElement>(".widget");
+  if (!widget) return;
+  const rect = widget.getBoundingClientRect();
+  const width = Math.ceil(rect.width) + 12;
+  const height = Math.ceil(rect.height) + 12;
+  if (width >= 80 && height >= 80) {
+    invoke("resize_light_to_fit", { width, height }).catch(() => {});
+  }
 }
 
 async function selectSession(session: SessionSnapshot) {
@@ -547,6 +551,13 @@ teamSave?.addEventListener("click", async () => {
 refresh();
 refreshHooksStatus();
 publishHitRegions();
+const widgetRoot = document.querySelector<HTMLElement>(".widget");
+if (widgetRoot) {
+  new ResizeObserver(() => {
+    fitWindowToWidget();
+    publishHitRegions();
+  }).observe(widgetRoot);
+}
 // The shell shows the window without waiting for this. A custom-protocol
 // miss must not leave the HWND hidden.
 invoke("window_ready").catch(() => {});

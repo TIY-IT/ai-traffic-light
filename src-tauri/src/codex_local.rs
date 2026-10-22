@@ -51,7 +51,7 @@ fn aggregate(rows:&[Row],now:u64)->Vec<SessionSnapshot>{
   }
   let state=if root.state=="working"||working>0{"working"}else if unknown>0{"idle"}else{root.state};
   let label=if working>0{format!("运行中 · {} 个子代理",working)}else{match state{"working"=>"运行中".into(),"completed"=>"已停止".into(),_=>"状态待确认".into()}};
-  SessionSnapshot{id:format!("codex:{}",root.id),client:"codex".into(),title:root.title.chars().take(80).collect(),state:state.into(),label:label.clone(),message:label,updated_at:now,created_at:root.started}
+  SessionSnapshot{id:format!("codex:{}",root.id),client:"codex".into(),title:root.title.clone(),state:state.into(),label:label.clone(),message:label,updated_at:now,created_at:root.started}
  }).collect()
 }
 fn read(home:&Path)->Result<Vec<SessionSnapshot>,Box<dyn std::error::Error>>{
@@ -93,8 +93,7 @@ pub fn start(){std::thread::spawn(||{
 });}
 pub fn sessions()->Vec<SessionSnapshot>{CACHE.lock().ok().and_then(|c|c.as_ref().filter(|(at,_)|at.elapsed()<Duration::from_secs(5)).map(|(_,r)|r.clone())).unwrap_or_default()}
 
-const MAX_PROMPTS: usize = 16;
-const MAX_PROMPT_CHARS: usize = 180;
+const MAX_PROMPTS: usize = 500;
 
 fn valid_thread_id(id: &str) -> bool {
     (8..=128).contains(&id.len())
@@ -119,15 +118,6 @@ fn collapse_ws(text: &str) -> String {
         }
         out.push(ch);
     }
-    out
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
     out
 }
 
@@ -241,7 +231,7 @@ fn prompt_from_line(line: &str) -> Option<String> {
     if collapsed.is_empty() {
         return None;
     }
-    Some(truncate_chars(&collapsed, MAX_PROMPT_CHARS))
+    Some(collapsed)
 }
 
 #[cfg(test)]
@@ -452,17 +442,25 @@ pub fn user_prompts(session_id: &str) -> Result<Vec<String>, String> {
   );
  }
  #[test]
+ fn user_prompts_keep_the_full_question() {
+  let long = "问".repeat(400);
+  let text = format!(
+   "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{long}\"}}}}\n"
+  );
+  assert_eq!(parse_user_prompts(&text), vec![long]);
+ }
+ #[test]
  fn user_prompts_keep_only_the_latest_ones() {
   let mut text = String::new();
-  for index in 0..20 {
+  for index in 0..MAX_PROMPTS + 4 {
    text.push_str(&format!(
     "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"问题 {index}\"}}}}\n"
    ));
   }
   let prompts = parse_user_prompts(&text);
-  assert_eq!(prompts.len(), 16);
+  assert_eq!(prompts.len(), MAX_PROMPTS);
   assert_eq!(prompts[0], "问题 4");
-  assert_eq!(prompts[15], "问题 19");
+  assert_eq!(prompts[MAX_PROMPTS - 1], format!("问题 {}", MAX_PROMPTS + 3));
  }
  #[test]
  fn invalid_thread_ids_are_rejected() {
