@@ -14,10 +14,12 @@ mod workbuddy_local;
 mod zcode;
 
 use sessions::{clear_sessions, delete_session, StatusSnapshot};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
     menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
@@ -93,20 +95,57 @@ struct WindowBox {
     h: f64,
 }
 
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else if fallback.is_finite() {
+        fallback
+    } else {
+        0.0
+    }
+}
+
+/// `f64::clamp` panics when a bound is NaN or min > max. Monitor origins are
+/// negative on this machine, and a failed query must not take the process down.
+fn safe_clamp(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    let value = finite_or(value, fallback);
+    if !min.is_finite() || !max.is_finite() || min > max {
+        return value;
+    }
+    value.clamp(min, max)
+}
+
+fn to_i32_px(value: f64) -> i32 {
+    let value = finite_or(value, 0.0).round();
+    if value >= i32::MAX as f64 {
+        i32::MAX
+    } else if value <= i32::MIN as f64 {
+        i32::MIN
+    } else {
+        value as i32
+    }
+}
+
+fn to_u32_px(value: f64) -> u32 {
+    let value = finite_or(value, 1.0).round();
+    if value <= 1.0 {
+        1
+    } else if value >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        value as u32
+    }
+}
+
 fn clamp_on_monitor(mon: MonitorBox, win: WindowBox, x: f64, y: f64) -> (f64, f64) {
-    let (min_x, max_x) = (mon.x + 80.0 - win.w, mon.x + mon.w - 80.0);
-    let (min_y, max_y) = (mon.y + 80.0 - win.h, mon.y + mon.h - 80.0);
-    let x = if min_x <= max_x {
-        x.clamp(min_x, max_x)
-    } else {
-        mon.x
-    };
-    let y = if min_y <= max_y {
-        y.clamp(min_y, max_y)
-    } else {
-        mon.y
-    };
-    (x, y)
+    let min_x = mon.x + 80.0 - win.w;
+    let max_x = mon.x + mon.w - 80.0;
+    let min_y = mon.y + 80.0 - win.h;
+    let max_y = mon.y + mon.h - 80.0;
+    (
+        safe_clamp(x, min_x, max_x, mon.x),
+        safe_clamp(y, min_y, max_y, mon.y),
+    )
 }
 
 /// Place from the monitor's top-right. Insets that land in the left or lower
@@ -253,6 +292,9 @@ fn primary_work(window: &tauri::WebviewWindow) -> Option<(MonitorBox, f64)> {
 static PROGRAMMATIC_POS: OnceLock<Mutex<Option<(i32, i32)>>> = OnceLock::new();
 static USER_DRAGGED: AtomicBool = AtomicBool::new(false);
 static LAUNCH_AT: OnceLock<Instant> = OnceLock::new();
+static QUITTING: AtomicBool = AtomicBool::new(false);
+static REBUILDS: AtomicU8 = AtomicU8::new(0);
+static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn launch_clock() -> Instant {
     *LAUNCH_AT.get_or_init(Instant::now)
@@ -326,13 +368,106 @@ fn launch_physical_size(scale: f64, reset_to_start: bool) -> (f64, f64) {
     (START_LOGICAL_W * scale, START_LOGICAL_H * scale)
 }
 
+fn log_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let local = local.trim();
+            if !local.is_empty() {
+                return PathBuf::from(local)
+                    .join("com.pcj1997.ai-traffic-light")
+                    .join("logs")
+                    .join("app.log");
+            }
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ai-traffic-light")
+        .join("logs")
+        .join("app.log")
+}
+
+fn log_line(message: &str) {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let line = format!("{millis} {message}\n");
+    let Ok(guard) = LOG_LOCK.get_or_init(|| Mutex::new(())).lock() else {
+        return;
+    };
+    let path = log_path();
+    let write = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    })();
+    drop(guard);
+    let _ = write;
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|site| format!("{}:{}:{}", site.file(), site.line(), site.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        // Write the file directly. `log_line` takes LOG_LOCK, and the panicking
+        // thread may already hold it — locking again here would deadlock.
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let line = format!("{millis} PANIC at {location}: {message}\n");
+        let path = log_path();
+        let _ = (|| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            file.write_all(line.as_bytes())?;
+            Ok(())
+        })();
+        previous(info);
+    }));
+}
+
 fn place_primary_top_right(
     window: &tauri::WebviewWindow,
     reset_to_start: bool,
 ) -> Option<(i32, i32, i32, i32)> {
-    let (work, scale) = primary_work(window)?;
+    log_monitors(window);
+    let (work, scale) = match primary_work(window) {
+        Some(found) => found,
+        None => {
+            log_line("place skipped: no monitor");
+            return None;
+        }
+    };
+    log_line(&format!(
+        "primary work x={} y={} w={} h={} scale={scale}",
+        work.x, work.y, work.w, work.h
+    ));
     let (width, height) = launch_physical_size(scale, reset_to_start);
     if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        log_line(&format!("place skipped: bad size {width}x{height}"));
         return None;
     }
     let (x, y) = top_right_on_work(
@@ -345,27 +480,172 @@ fn place_primary_top_right(
         scale,
     );
     if !x.is_finite() || !y.is_finite() {
+        log_line(&format!("place skipped: bad origin {x},{y}"));
         return None;
     }
-    let _ = window.set_size(tauri::PhysicalSize::new(
-        width.round() as u32,
-        height.round() as u32,
+    let px = to_u32_px(width);
+    let py = to_u32_px(height);
+    let ix = to_i32_px(x);
+    let iy = to_i32_px(y);
+    match window.set_size(tauri::PhysicalSize::new(px, py)) {
+        Ok(()) => log_line(&format!("set_size {px}x{py}")),
+        Err(error) => log_line(&format!("set_size error: {error}")),
+    }
+    note_programmatic_pos(ix as f64, iy as f64);
+    match window.set_position(tauri::PhysicalPosition::new(ix, iy)) {
+        Ok(()) => log_line(&format!("set_position {ix},{iy}")),
+        Err(error) => log_line(&format!("set_position error: {error}")),
+    }
+    Some((ix, iy, to_i32_px(width), to_i32_px(height)))
+}
+
+fn log_monitors(window: &tauri::WebviewWindow) {
+    match window.available_monitors() {
+        Ok(monitors) => {
+            for (index, monitor) in monitors.iter().enumerate() {
+                let (full, work, scale) = monitor_rects(monitor);
+                log_line(&format!(
+                    "monitor[{index}] name={:?} scale={scale} full={},{} {}x{} work={},{} {}x{}",
+                    monitor.name(),
+                    full.x,
+                    full.y,
+                    full.w,
+                    full.h,
+                    work.x,
+                    work.y,
+                    work.w,
+                    work.h
+                ));
+            }
+        }
+        Err(error) => log_line(&format!("available_monitors error: {error}")),
+    }
+    match window.primary_monitor() {
+        Ok(Some(monitor)) => log_line(&format!("primary name={:?}", monitor.name())),
+        Ok(None) => log_line("primary monitor: none"),
+        Err(error) => log_line(&format!("primary_monitor error: {error}")),
+    }
+}
+
+fn open_configured_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .ok_or_else(|| "tauri.conf.json has no window labeled main".to_string())?;
+    log_line(&format!(
+        "from_config label={} create={} visible={} {}x{} at {:?},{:?}",
+        config.label,
+        config.create,
+        config.visible,
+        config.width,
+        config.height,
+        config.x,
+        config.y
     ));
-    note_programmatic_pos(x, y);
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-    Some((
-        x.round() as i32,
-        y.round() as i32,
-        width.round() as i32,
-        height.round() as i32,
-    ))
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|error| error.to_string())?
+        .visible(true)
+        .build()
+        .map_err(|error| error.to_string())?;
+    Ok(window)
+}
+
+fn open_fallback_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    log_line("creating fallback WebviewWindowBuilder");
+    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+        .title("AI Traffic Light")
+        .inner_size(START_LOGICAL_W, START_LOGICAL_H)
+        .min_inner_size(MIN_LOGICAL_W, MIN_LOGICAL_H)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .resizable(false)
+        .skip_taskbar(true)
+        .shadow(false)
+        .visible(true)
+        .focused(true)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window("main").is_some() {
+        log_line("main window already exists");
+        return Ok(());
+    }
+    log_line("main window missing, creating");
+    // The closure returns Result<(), String>, not the window: WebviewWindow is
+    // not UnwindSafe, and catch_unwind requires the success type to be.
+    let configured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_configured_window(app).map(|_| ())
+    }));
+    match configured {
+        Ok(Ok(())) => {
+            log_line("configured window created");
+            return Ok(());
+        }
+        Ok(Err(error)) => log_line(&format!("configured window failed: {error}")),
+        Err(_) => log_line("configured window panicked"),
+    }
+    if app.get_webview_window("main").is_some() {
+        log_line("main window appeared after configured attempt");
+        return Ok(());
+    }
+    let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open_fallback_window(app).map(|_| ())
+    }));
+    match fallback {
+        Ok(Ok(())) => {
+            log_line("fallback window created");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            log_line(&format!("fallback window failed: {error}"));
+            Err(error)
+        }
+        Err(_) => {
+            log_line("fallback window panicked");
+            Err("fallback window panicked".to_string())
+        }
+    }
+}
+
+fn log_window_state(window: &tauri::WebviewWindow, stage: &str) {
+    let visible = window
+        .is_visible()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|error| format!("err {error}"));
+    let position = window
+        .outer_position()
+        .map(|pos| format!("{},{}", pos.x, pos.y))
+        .unwrap_or_else(|error| format!("err {error}"));
+    let size = window
+        .outer_size()
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|error| format!("err {error}"));
+    log_line(&format!(
+        "{stage}: visible={visible} pos={position} size={size}"
+    ));
 }
 
 /// Show the main window. `place` pins it to the primary work area's top-right.
-/// Positioning failure still shows and focuses. The frontend `window_ready`
-/// invoke is not a gate: the page may never load in a release build.
-fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool) {
+/// Positioning failure still shows and focuses. `native` is the Win32 show of
+/// the parent only; child WebView2 HWNDs are left alone because showing them
+/// during startup re-enters the controller and can destroy the parent.
+/// The frontend `window_ready` invoke is not a gate.
+fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool, native: bool) {
+    if app.get_webview_window("main").is_none() {
+        if let Err(error) = ensure_main_window(app) {
+            log_line(&format!("present aborted: {error}"));
+            return;
+        }
+    }
     let Some(window) = app.get_webview_window("main") else {
+        log_line("present aborted: main still missing");
         return;
     };
     let needs_focus = place || window.is_visible().ok() != Some(true);
@@ -374,20 +654,37 @@ fn present_main_window(app: &AppHandle, place: bool, reset_to_start: bool) {
     } else {
         None
     };
-    let _ = window.unminimize();
-    let _ = window.show();
+    match window.unminimize() {
+        Ok(()) => log_line("unminimize ok"),
+        Err(error) => log_line(&format!("unminimize error: {error}")),
+    }
+    match window.show() {
+        Ok(()) => log_line("show ok"),
+        Err(error) => log_line(&format!("show error: {error}")),
+    }
     #[cfg(windows)]
-    if let Ok(hwnd) = window.hwnd() {
-        // tao's Show path calls SetWindowPos(SWP_FRAMECHANGED) without
-        // SWP_SHOWWINDOW, which clears WS_VISIBLE on a window that was born
-        // hidden. Force the bit after that style refresh.
-        force_show_win32(hwnd.0, placed, needs_focus);
+    if native {
+        match window.hwnd() {
+            Ok(hwnd) => force_show_win32(hwnd.0, placed, needs_focus),
+            Err(error) => log_line(&format!("hwnd error: {error}")),
+        }
     }
     #[cfg(not(windows))]
-    let _ = placed;
+    let _ = (native, placed);
     if needs_focus {
-        let _ = window.set_focus();
+        match window.set_focus() {
+            Ok(()) => log_line("set_focus ok"),
+            Err(error) => log_line(&format!("set_focus error: {error}")),
+        }
     }
+    log_window_state(
+        &window,
+        if native {
+            "after native show"
+        } else {
+            "after tauri show"
+        },
+    );
 }
 
 fn schedule_present(app: AppHandle, delay_ms: u64) {
@@ -397,11 +694,13 @@ fn schedule_present(app: AppHandle, delay_ms: u64) {
         let for_task = queued.clone();
         if app
             .run_on_main_thread(move || {
+                log_line("deferred present");
                 let place = main_window_hidden(&for_task) || launch_should_place();
-                present_main_window(&for_task, place, false);
+                present_main_window(&for_task, place, false, true);
             })
             .is_err()
         {
+            log_line("run_on_main_thread failed; showing without native call");
             let _ = queued.get_webview_window("main").map(|window| {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -411,46 +710,67 @@ fn schedule_present(app: AppHandle, delay_ms: u64) {
     });
 }
 
+fn schedule_recreate(app: AppHandle) {
+    if QUITTING.load(Ordering::Relaxed) {
+        return;
+    }
+    if REBUILDS.fetch_add(1, Ordering::Relaxed) >= 2 {
+        log_line("main destroyed; not recreating again");
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        let queued = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            log_line("recreate main after destroy");
+            let _ = ensure_main_window(&queued);
+            present_main_window(&queued, true, true, true);
+        });
+    });
+}
+
 #[cfg(windows)]
 fn force_show_win32(raw: *mut std::ffi::c_void, place: Option<(i32, i32, i32, i32)>, focus: bool) {
-    use winapi::shared::minwindef::LPARAM;
     use winapi::shared::windef::HWND;
     use winapi::um::winuser::{
-        EnumChildWindows, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST,
+        IsIconic, IsWindow, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST,
         SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, SW_SHOWNA,
     };
 
+    if raw.is_null() {
+        log_line("native show skipped: null hwnd");
+        return;
+    }
     let hwnd = raw as HWND;
     unsafe {
+        if IsWindow(hwnd) == 0 {
+            log_line("native show skipped: hwnd is not a window");
+            return;
+        }
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
+            log_line("native SW_RESTORE");
         }
-        ShowWindow(hwnd, if focus { SW_SHOW } else { SW_SHOWNA });
+        let shown = ShowWindow(hwnd, if focus { SW_SHOW } else { SW_SHOWNA });
+        log_line(&format!("native ShowWindow previous_visible={shown}"));
         if let Some((x, y, width, height)) = place {
-            // After ShowWindow, so a restored WINDOWPLACEMENT cannot put the
-            // old rect (or SW_HIDE) back.
             let mut flags = SWP_SHOWWINDOW;
             if !focus {
                 flags |= SWP_NOACTIVATE;
             }
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, width.max(1), height.max(1), flags);
+            let ok = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width.max(1), height.max(1), flags);
+            log_line(&format!(
+                "native SetWindowPos {x},{y} {}x{} ok={}",
+                width.max(1),
+                height.max(1),
+                ok != 0
+            ));
         }
-        EnumChildWindows(hwnd, Some(show_child_window), 0 as LPARAM);
         if focus {
-            SetForegroundWindow(hwnd);
+            let ok = SetForegroundWindow(hwnd);
+            log_line(&format!("native SetForegroundWindow ok={}", ok != 0));
         }
     }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn show_child_window(
-    hwnd: winapi::shared::windef::HWND,
-    _: winapi::shared::minwindef::LPARAM,
-) -> i32 {
-    // The WebView2 child is created without WS_VISIBLE when the window config
-    // says visible:false. WebviewWindow::show does not flip that child.
-    winapi::um::winuser::ShowWindow(hwnd, winapi::um::winuser::SW_SHOW);
-    1
 }
 
 static LAST_FIT: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
@@ -569,7 +889,7 @@ fn tray_icon(state: &str) -> Image<'static> {
 
 fn show_window(app: &AppHandle) {
     let place = main_window_hidden(app) || launch_should_place();
-    present_main_window(app, place, false);
+    present_main_window(app, place, false, true);
 }
 
 // Page load is not required. If this never arrives (missing dist, custom
@@ -580,7 +900,7 @@ fn window_ready(app: AppHandle) {
     if app
         .run_on_main_thread(move || {
             let place = main_window_hidden(&queued) || launch_should_place();
-            present_main_window(&queued, place, false);
+            present_main_window(&queued, place, false, true);
         })
         .is_err()
     {
@@ -594,7 +914,15 @@ fn window_ready(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    install_panic_hook();
+    log_line(&format!(
+        "start cwd={:?} exe={:?} args={:?}",
+        std::env::current_dir().ok(),
+        std::env::current_exe().ok(),
+        std::env::args().collect::<Vec<_>>()
+    ));
+    log_line(&format!("log file {}", log_path().display()));
+    let builder = tauri::Builder::default()
         // Must be the first plugin: a second launch (shortcut re-click, duplicate
         // autostart entry) exits here and just raises the existing window instead
         // of stacking another lamp.
@@ -602,7 +930,7 @@ pub fn run() {
             let queued = app.clone();
             let _ = app.run_on_main_thread(move || {
                 let place = main_window_hidden(&queued) || launch_should_place();
-                present_main_window(&queued, place, false);
+                present_main_window(&queued, place, false, true);
             });
         }))
         .plugin(tauri_plugin_notification::init())
@@ -628,10 +956,17 @@ pub fn run() {
             reporter::report_status
         ])
         .setup(|app| {
+            log_line("setup begin");
             if std::env::args().any(|a| a == "--enable-autostart") {
-                app.autolaunch().enable()?;
+                match app.autolaunch().enable() {
+                    Ok(()) => log_line("autostart enabled"),
+                    Err(error) => log_line(&format!("autostart error: {error}")),
+                }
             }
-            bridge::start().map_err(|e| std::io::Error::other(e.to_string()))?;
+            if let Err(error) = bridge::start() {
+                log_line(&format!("bridge start error: {error}"));
+                return Err(std::io::Error::other(error.to_string()).into());
+            }
             marvis::start();
             zcode::start();
             coze::start();
@@ -642,23 +977,43 @@ pub fn run() {
             reporter::start();
             notify::start(app.handle().clone());
 
-            // Distinguish a user drag from the placement we apply below.
-            // Showing does not wait for the webview's window_ready invoke.
+            // The config window is not auto-created (`create: false`). Build it
+            // here so a failure is logged and the fallback builder can run,
+            // instead of Tauri panicking before this hook.
             let _ = launch_clock();
-            if let Some(window) = app.get_webview_window("main") {
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Moved(pos) = event {
-                        note_user_drag(pos.x as f64, pos.y as f64);
-                    }
-                });
+            if let Err(error) = ensure_main_window(app.handle()) {
+                log_line(&format!("setup ensure failed: {error}"));
             }
-            present_main_window(app.handle(), true, true);
+            if let Some(window) = app.get_webview_window("main") {
+                let rebuild = app.handle().clone();
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Moved(pos) => note_user_drag(pos.x as f64, pos.y as f64),
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        log_line("main CloseRequested");
+                        if !QUITTING.load(Ordering::Relaxed)
+                            && launch_clock().elapsed() < Duration::from_secs(8)
+                        {
+                            api.prevent_close();
+                            log_line("prevented CloseRequested during launch");
+                        }
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        log_line("main Destroyed");
+                        schedule_recreate(rebuild.clone());
+                    }
+                    _ => {}
+                });
+            } else {
+                log_line("setup: main window still absent");
+            }
+            // Tauri show only. Native ShowWindow is deferred so it does not
+            // re-enter WebView2 while the controller is still starting.
+            present_main_window(app.handle(), true, true, false);
+            schedule_present(app.handle().clone(), 100);
             schedule_present(app.handle().clone(), 300);
             schedule_present(app.handle().clone(), 1200);
-            // Late enough to beat a WINDOWPLACEMENT restore, still shows if
-            // the page never called window_ready. Does not steal focus when
-            // the window is already visible and the user has dragged it.
             schedule_present(app.handle().clone(), 2500);
+            log_line("setup window scheduled");
 
             // Hit-test polling: only lamps/panels receive mouse events, everything
             // else passes clicks through to windows underneath. Windows hit-testing
@@ -764,7 +1119,11 @@ pub fn run() {
                         notify::set_enabled(new_value);
                         let _ = menu_notify_item.set_checked(new_value);
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        QUITTING.store(true, Ordering::Relaxed);
+                        log_line("quit from tray");
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
@@ -800,18 +1159,34 @@ pub fn run() {
                 }
             });
 
+            log_line("setup end");
             Ok(())
-        })
-        .build(tauri::generate_context!())
-        .expect("error while building AI Traffic Light")
-        .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Ready) {
-                // setup() already ran inside Ready. Show once more in case
-                // Windows restored a hidden placement while startup finished.
-                let place = main_window_hidden(app) || launch_should_place();
-                present_main_window(app, place, false);
-            }
         });
+    match builder.build(tauri::generate_context!()) {
+        Ok(app) => {
+            log_line("builder ok");
+            app.run(|app, event| match event {
+                tauri::RunEvent::Ready => {
+                    log_line("RunEvent::Ready");
+                    let place = main_window_hidden(app) || launch_should_place();
+                    present_main_window(app, place, false, false);
+                }
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    log_line(&format!("ExitRequested code={code:?}"));
+                    // Last-window Destroyed asks to exit with code None. Tray quit
+                    // calls app.exit(0), which arrives as Some. Keep the process
+                    // up so a destroyed main window can be created again.
+                    if code.is_none() && !QUITTING.load(Ordering::Relaxed) {
+                        api.prevent_exit();
+                        log_line("prevented exit after main window closed");
+                    }
+                }
+                tauri::RunEvent::Exit => log_line("Exit"),
+                _ => {}
+            });
+        }
+        Err(error) => log_line(&format!("builder failed: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -1036,5 +1411,28 @@ mod tests {
             super::pick_primary_work(None, &available),
             Some(primary_work)
         );
+    }
+
+    #[test]
+    fn clamp_survives_nan_and_negative_monitors() {
+        let mon = super::MonitorBox {
+            x: -1720.0,
+            y: -2271.0,
+            w: 2560.0,
+            h: 1440.0,
+        };
+        let (x, y) = super::clamp_on_monitor(
+            mon,
+            super::WindowBox {
+                w: f64::NAN,
+                h: f64::NAN,
+            },
+            f64::NAN,
+            f64::NAN,
+        );
+        assert!(x.is_finite() && y.is_finite());
+        assert_eq!(super::to_i32_px(-1720.4), -1720);
+        assert_eq!(super::to_i32_px(f64::NAN), 0);
+        assert_eq!(super::to_u32_px(-5.0), 1);
     }
 }
